@@ -1,0 +1,6 @@
+{
+  "identifier": "main-events",
+  "description": "Only the main local webview can subscribe to application events",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

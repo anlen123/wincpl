@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.DS_Store
+target/
+*.exe
+*.dll
+*.msi
+*.pdb
+*.sqlite3
+*.sqlite3-*
+.env
+.env.*
+config.yaml

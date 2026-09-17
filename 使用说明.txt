@@ -1,0 +1,70 @@
+剪藏 · Windows 11 本地剪贴板
+
+开发与构建
+  在 Windows 本地目录打开 PowerShell，安装 Node.js 22+、Rust stable MSVC、
+  Visual Studio C++ Build Tools（桌面 C++ 工作负载与 Windows SDK）。
+  Windows 11 通常已包含 WebView2 Runtime。
+  开发运行：powershell -ExecutionPolicy Bypass -File .\build-windows.ps1 -Dev
+  生成安装包：powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+  安装包位置：src-tauri\target\release\bundle\nsis\
+  仓库也提供 GitHub Actions Windows 构建工作流。
+  GNU 交叉编译产物需要同目录的 WebView2Loader.dll，不能只复制 exe。
+  推荐使用 Windows MSVC 构建的 NSIS 安装包作为正式分发版本。
+
+使用
+  程序运行后在系统托盘驻留，不占任务栏。
+  默认 Ctrl+Alt+V 呼出剪贴板：优先靠近文字插入点，读取不到时靠近鼠标。
+  直接输入文字搜索，支持中文输入法；上下键选择，回车或鼠标左键粘贴。
+  Escape 或失去焦点隐藏；通过托盘菜单退出。
+  默认返回最新 20 条（history.display_limit），保存最多 100 条（history.max_items）。
+  默认 400×560 窗口首屏可见 10 项；每次呼出选中第一项，输入框自动获得焦点。
+  搜索覆盖全部仍保留的历史，再按 display_limit 限制结果数量。
+  重复复制相同文字/图片只保留一条并置顶；成功发送粘贴按键后也会置顶。
+
+配置
+  首次启动生成 %LOCALAPPDATA%\com.winctl.jianzang\config.yaml。
+  从界面设置或托盘菜单打开 YAML，修改保存后选择“重新加载配置”。
+  config.example.yaml 是完整示例，包含颜色、字体、字号、尺寸、快捷键和限制。
+  默认 hotkeys.paste 为 Shift+Insert，可改为 Ctrl+V 等组合。
+  默认 Ctrl+Alt+S 呼出代码片段；两个呼出快捷键必须不同。
+  Super 指 Windows 徽标键；系统保留的 Win+V 可能注册失败，不再强行接管。
+  YAML 各字段均附有范围、单位、作用和注意事项；不存在的 snippets 字段默认 Ctrl+Alt+S。
+  不会把真实快捷键发给无法恢复的目标窗口。Windows 权限隔离可能阻止
+  普通权限应用向管理员程序粘贴；请手动粘贴或让两个程序使用相同权限。
+
+代码片段
+  Ctrl+Alt+S 呼出，直接输入只搜索片段标题，不搜索正文。
+  右上角 + 新增：填写唯一标题和完整内容，保存或 Ctrl+Enter 提交。
+  上下键选择后，点编辑可修改标题/内容，点删除需确认；Esc 取消编辑。
+  Enter 或左键把选中片段的内容粘贴到之前的目标窗口，不会粘贴标题。
+  内容保留缩进、换行，不执行代码、不做模板变量替换。
+  标题最多 200 字符，正文最多 100000 字符；片段独立存入本地 SQLite。
+  不受历史 max_items 限制，清空剪贴板历史不会删除片段。
+  编辑过程中失去焦点不会清空草稿；取消未保存修改会先确认。
+
+图片与本地 OCR
+  支持剪贴板位图/PNG，保留原图用于粘贴，列表使用缩略图。
+  Windows.Media.Ocr 离线提取图片文字，再取短摘要；全文参与搜索。
+  不是视觉模型：不会为无文字照片自动生成“猫”“风景”等场景标签。
+  OCR 语言可在 YAML 中指定；识别语言必须安装 Windows 对应 OCR 语言包。
+  安装方法：Windows 设置 → 时间和语言 → 语言和区域 → 对应语言的语言选项。
+  原尺寸返回空结果时，在引擎尺寸上限内放大两倍重试一次，小字号截图也可识别。
+  中文字符之间的 OCR 空格会被合并，便于直接搜索连续中文词。
+  升级时旧空结果自动重试一次；可在设置中对所选图片重新识别，并查看失败原因。
+  OCR 失败不影响图片保留、缩略图显示和再次粘贴。
+
+隐私与资源
+  不上传任何剪贴板数据；历史 SQLite 和图片保存在上述本地数据目录。
+  历史未加密，可能包含密码、令牌、隐私文本。共享电脑不宜运行。
+  设置内可删除条目或清空历史；清空历史不会清空 Windows 当前剪贴板。
+  剪贴板使用系统事件监听，OCR 串行执行，历史数量和单条大小有上限。
+  WebView2 是独立进程，实际总内存需合计全部子进程，不能只看 Rust 主进程。
+
+验证边界
+  Linux/WSL 浏览器预览不是桌面应用，不会采集系统剪贴板。
+  Windows 原生快捷键、焦点恢复、粘贴、毛玻璃和 OCR 应在真实 Windows
+  程序内验证，尤其是多显示器不同 DPI、中文输入法和管理员目标窗口。
+  已通过存储/配置/OCR 文本处理回归测试、Windows GNU 编译及浏览器界面检查。
+  Windows 已验证 Ctrl+Alt+V / Ctrl+Alt+S 可以注册；原图 OCR 曾完成原生烟测。
+  未完成 Windows 完整桌面端到端测试、所有第三方程序的粘贴兼容性或实际内存测量。
+  之前 GNU 产物曾被 Defender 隔离；新构建不代表已经获得微软安全复核。
