@@ -27,6 +27,7 @@ struct AppState {
     ocr_wake: SyncSender<()>,
     last_error: Mutex<Option<String>>,
     snippet_mode: AtomicBool,
+    preview: Mutex<Option<Entry>>,
 }
 
 fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
@@ -59,7 +60,7 @@ fn toggle(app: &tauri::AppHandle, snippets: bool) -> Result<(), String> {
     }
     let visible = window.is_visible().map_err(|e| e.to_string())?;
     if visible && state.snippet_mode.load(Ordering::Acquire) == snippets {
-        return window.hide().map_err(|e| e.to_string());
+        return hide_popup(app.clone());
     }
     if !visible {
         let target = platform::target_window();
@@ -110,7 +111,59 @@ async fn list_entries(app: tauri::AppHandle, query: String) -> Result<Vec<Entry>
 
 #[tauri::command]
 fn hide_popup(app: tauri::AppHandle) -> Result<(), String> {
+    clear_preview(&app)?;
     window(&app)?.hide().map_err(|e| e.to_string())
+}
+
+fn clear_preview(app: &tauri::AppHandle) -> Result<(), String> {
+    *lock(&app.state::<AppState>().preview)? = None;
+    if let Some(preview) = app.get_webview_window("preview") {
+        platform::hide_preview(&preview)?;
+        preview
+            .emit("preview-changed", ())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_preview(state: tauri::State<AppState>) -> Result<Option<Entry>, String> {
+    Ok(lock(&state.preview)?.clone())
+}
+
+#[tauri::command]
+fn select_preview(app: tauri::AppHandle, id: Option<i64>) -> Result<(), String> {
+    let main = window(&app)?;
+    let state = app.state::<AppState>();
+    if id.is_none()
+        || !main.is_visible().map_err(|e| e.to_string())?
+        || state.snippet_mode.load(Ordering::Acquire)
+    {
+        return clear_preview(&app);
+    }
+    let entry = lock(&state.store)?.get(id.unwrap())?;
+    *lock(&state.preview)? = Some(entry);
+    let preview = app.get_webview_window("preview").ok_or("预览窗口不存在")?;
+    preview
+        .emit("preview-changed", ())
+        .map_err(|e| e.to_string())?;
+    platform::show_preview(&preview, &main)
+}
+
+fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
+    value
+        .split('+')
+        .map(|token| {
+            if token.eq_ignore_ascii_case("win") || token.eq_ignore_ascii_case("meta") {
+                "Super"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+        .parse::<Shortcut>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -155,16 +208,8 @@ fn open_config(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 fn shortcuts(config: &Config) -> Result<[Shortcut; 2], String> {
-    let clipboard = config
-        .hotkeys
-        .toggle
-        .parse::<Shortcut>()
-        .map_err(|e| e.to_string())?;
-    let snippets = config
-        .hotkeys
-        .snippets
-        .parse::<Shortcut>()
-        .map_err(|e| e.to_string())?;
+    let clipboard = parse_shortcut(&config.hotkeys.toggle)?;
+    let snippets = parse_shortcut(&config.hotkeys.snippets)?;
     if clipboard == snippets {
         return Err("剪贴板和代码片段不能使用同一个呼出快捷键".into());
     }
@@ -317,7 +362,7 @@ async fn paste_item(app: tauri::AppHandle, id: i64, snippet: bool) -> Result<(),
                 .own_sequence
                 .store(platform::clipboard_sequence(), Ordering::Release);
             drop(clipboard);
-            window(&app)?.hide().map_err(|e| e.to_string())?;
+            hide_popup(app.clone())?;
             platform::paste_to(target, &chord)?;
             if !snippet {
                 lock(&state.store)?.touch(id)?;
@@ -510,6 +555,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             get_popup_mode,
+            get_preview,
+            select_preview,
             list_snippets,
             get_snippet,
             save_snippet,
@@ -543,6 +590,7 @@ pub fn run() {
                 ocr_wake,
                 last_error: Mutex::new(None),
                 snippet_mode: AtomicBool::new(false),
+                preview: Mutex::new(None),
             });
             let popup = window(app.handle())?;
             popup.set_size(tauri::LogicalSize::new(
@@ -592,10 +640,22 @@ pub fn run() {
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.hide();
+                let _ = hide_popup(window.app_handle().clone());
             }
             tauri::WindowEvent::Focused(false) => {
-                let _ = window.hide();
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let foreground = platform::target_window();
+                    let inside = ["main", "preview"].iter().any(|label| {
+                        app.get_webview_window(label)
+                            .and_then(|w| w.hwnd().ok())
+                            .is_some_and(|hwnd| hwnd.0 as isize == foreground)
+                    });
+                    if !inside {
+                        let _ = hide_popup(app);
+                    }
+                });
             }
             _ => {}
         })

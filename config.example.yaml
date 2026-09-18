@@ -8,11 +8,11 @@
 hotkeys:
   # 全局快捷键：即使剪藏没有焦点也能呼出；在同一面板再次按下则隐藏。
   # Ctrl=控制键，Alt=替换键，Shift=上档键；+ 表示同时按，不是先后按。
-  # Super 是 Windows 徽标键（通常在 Ctrl 与 Alt 之间），不是另一个物理键。
-  # Windows 保留 Win+V 等组合，不能保证注册成功；本程序不再用键盘钩子强行接管。
+  # Super / Win / Meta 均表示 Windows 徽标键；如 Win+Alt+V，不能单独用 Win。
+  # Windows 保留 Win+V 等组合；注册成功也不保证触发，本程序不强行接管。
   # 推荐 Ctrl+Alt+字母，示例 Ctrl+Alt+V、Ctrl+Alt+C；避免和其他软件冲突。
   # 两个呼出键不能相同；修改时允许互换两个面板的组合。
-  toggle: "Ctrl+Alt+V" # 剪贴板历史，按复制文字/OCR 图片文字搜索。
+  toggle: "Ctrl+Alt+V" # 剪贴板历史，支持正文/OCR 文字与无声调全拼搜索（nihao）。
   snippets: "Ctrl+Alt+S" # 代码片段，搜索标题，粘贴保存的完整内容。
   # 下面不是呼出键，也不是在面板中按的按键：它是选中后发送给目标软件的组合。
   # 面板仍用上下键选择、Enter 或左键粘贴、Esc 隐藏。

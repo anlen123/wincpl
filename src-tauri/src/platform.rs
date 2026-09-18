@@ -295,6 +295,61 @@ pub fn show_popup(window: &tauri::WebviewWindow, target: isize) -> Result<(), St
         .map_err(|error| format!("无法聚焦剪藏窗口：{error}"))
 }
 
+pub fn show_preview(
+    preview: &tauri::WebviewWindow,
+    main: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SW_SHOWNOACTIVATE,
+    };
+    let position = main.outer_position().map_err(|e| e.to_string())?;
+    let monitor = unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: position.x,
+                y: position.y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err("无法读取预览显示器工作区".into());
+    }
+    let scale = main.scale_factor().map_err(|e| e.to_string())?;
+    let gap = (16.0 * scale).round() as i32;
+    let work = info.rcWork;
+    let width = ((480.0 * scale).round() as i32).min((work.right - work.left - 2 * gap).max(1));
+    let height = ((560.0 * scale).round() as i32).min((work.bottom - work.top - 2 * gap).max(1));
+    let hwnd = preview.hwnd().map_err(|e| e.to_string())?;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            work.right - width - gap,
+            work.bottom - height - gap,
+            width,
+            height,
+            SWP_NOACTIVATE,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    Ok(())
+}
+
+pub fn hide_preview(preview: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let hwnd = preview.hwnd().map_err(|e| e.to_string())?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ParsedChord {
     modifiers: [VIRTUAL_KEY; 4],

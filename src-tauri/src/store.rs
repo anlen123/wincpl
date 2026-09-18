@@ -1,4 +1,5 @@
 use image::{codecs::png::PngEncoder, ImageBuffer, ImageEncoder, Rgba};
+use pinyin::ToPinyin;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -70,7 +71,7 @@ impl Store {
         fs::create_dir_all(&thumbnails_dir)
             .map_err(|error| format!("无法创建缩略图目录 {}：{error}", thumbnails_dir.display()))?;
 
-        let conn = Connection::open(dir.join("history.sqlite3"))
+        let mut conn = Connection::open(dir.join("history.sqlite3"))
             .map_err(|error| format!("无法打开历史数据库：{error}"))?;
         conn.busy_timeout(std::time::Duration::from_secs(3))
             .map_err(|error| format!("无法配置数据库等待时间：{error}"))?;
@@ -119,6 +120,39 @@ impl Store {
             conn.execute_batch("BEGIN; ALTER TABLE entries ADD COLUMN ocr_error TEXT;
                 UPDATE entries SET ocr_status = 'pending' WHERE kind = 'image' AND ocr_status = 'empty'; COMMIT;")
                 .map_err(|e| format!("无法升级 OCR 历史：{e}"))?;
+        }
+        let has_pinyin = conn
+            .prepare("PRAGMA table_info(entries)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|name| name == "pinyin");
+        if !has_pinyin {
+            let transaction = conn.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch("ALTER TABLE entries ADD COLUMN pinyin TEXT NOT NULL DEFAULT '';")
+                .map_err(|e| e.to_string())?;
+            {
+                let mut statement = transaction
+                    .prepare("SELECT id,text FROM entries")
+                    .map_err(|e| e.to_string())?;
+                let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                    let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                    let text: String = row.get(1).map_err(|e| e.to_string())?;
+                    transaction
+                        .execute(
+                            "UPDATE entries SET pinyin=?1 WHERE id=?2",
+                            params![search_pinyin(&text), id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            transaction.commit().map_err(|e| e.to_string())?;
         }
 
         let mut store = Self {
@@ -220,6 +254,7 @@ impl Store {
                 "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error
                  FROM entries
                  WHERE text LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+                    OR pinyin LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                  ORDER BY created_at DESC, id DESC LIMIT ?2",
                 Some(literal_like_pattern(query)),
             )
@@ -303,9 +338,9 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO entries
-                 (kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, content_hash)
-                 VALUES ('text', ?1, ?2, NULL, NULL, ?3, NULL, NULL, 'none', ?4)",
-                params![text, summary, created_at, hash],
+                 (kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, content_hash, pinyin)
+                 VALUES ('text', ?1, ?2, NULL, NULL, ?3, NULL, NULL, 'none', ?4, ?5)",
+                params![text, summary, created_at, hash, search_pinyin(text)],
             )
             .map_err(|error| format!("无法保存文字：{error}"))?;
         let id = self.conn.last_insert_rowid();
@@ -428,8 +463,8 @@ impl Store {
         let changed = self
             .conn
             .execute(
-                "UPDATE entries SET text = ?1, summary = ?2, ocr_status = ?3, ocr_error = ?5 WHERE id = ?4 AND kind = 'image'",
-                params![text, summary, status, id, if status == "error" { error } else { None }],
+                "UPDATE entries SET text = ?1, summary = ?2, ocr_status = ?3, ocr_error = ?5, pinyin = ?6 WHERE id = ?4 AND kind = 'image'",
+                params![text, summary, status, id, if status == "error" { error } else { None }, search_pinyin(text)],
             )
             .map_err(|error| format!("无法更新 OCR 结果：{error}"))?;
         if changed == 0 {
@@ -719,6 +754,18 @@ fn content_hash(prefix: &[u8], metadata: &[u8], content: &[u8]) -> String {
     output
 }
 
+fn search_pinyin(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for character in text.chars() {
+        if let Some(pinyin) = character.to_pinyin() {
+            result.push_str(pinyin.plain());
+        } else {
+            result.push(character.to_ascii_lowercase());
+        }
+    }
+    result
+}
+
 fn literal_like_pattern(query: &str) -> String {
     let mut pattern = String::with_capacity(query.len() + 2);
     pattern.push('%');
@@ -872,6 +919,46 @@ fn cleanup_directory(dir: &Path, referenced: &HashSet<PathBuf>) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pinyin_migration_and_ocr_updates_preserve_search_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        let text = store.insert_text("你好 Rust 100%_").unwrap();
+        let image = store.insert_image(&[0, 0, 0, 255], 1, 1).unwrap();
+        store.update_ocr(image, "你好图片", "ready", None).unwrap();
+        store
+            .conn
+            .execute_batch("ALTER TABLE entries DROP COLUMN pinyin")
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        assert_eq!(
+            store
+                .list("NIHAO", 20)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            [image, text]
+        );
+        assert_eq!(store.list("nihao Rust 100%_", 20).unwrap()[0].id, text);
+        assert_eq!(store.list("你好", 1).unwrap()[0].id, image);
+        store.retry_ocr(image).unwrap();
+        assert_eq!(
+            store
+                .list("nihao", 20)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            [text]
+        );
+        store.update_ocr(image, "再见", "ready", None).unwrap();
+        assert_eq!(store.list("zaijian", 20).unwrap()[0].id, image);
+        let fresh = store.insert_text("你好新记录").unwrap();
+        assert_eq!(store.list("nihao", 1).unwrap()[0].id, fresh);
+    }
+
     #[test]
     fn paste_and_copy_promote_one_record_searches_beyond_display_limit() {
         let dir = tempfile::tempdir().unwrap();

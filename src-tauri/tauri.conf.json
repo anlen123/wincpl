@@ -16,6 +16,12 @@
       "resizable": false, "alwaysOnTop": true, "skipTaskbar": true,
       "shadow": true, "backgroundColor": "#00000000",
       "windowEffects": { "effects": ["acrylic"], "color": [243, 242, 234, 160] }
+    }, {
+      "label": "preview", "title": "剪藏 · 完整预览", "url": "preview.html",
+      "width": 480, "height": 560, "visible": false, "focus": false,
+      "transparent": true, "decorations": false, "resizable": false,
+      "alwaysOnTop": true, "skipTaskbar": true,
+      "backgroundColor": "#00000000"
     }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost",

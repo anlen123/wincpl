@@ -99,6 +99,16 @@ let panelOpen = false;
 let historyRefreshPending = false;
 let resetSelectionPending = true;
 
+let previewQueue: Promise<unknown> = Promise.resolve();
+let previewRevision = 0;
+
+function syncPreview(id: number | null): void {
+  if (!hasNativeBackend) return;
+  const revision = ++previewRevision;
+  previewQueue = previewQueue.then(async () => {
+    if (revision === previewRevision) await invoke("select_preview", { id });
+  }).catch(showError);
+}
 const clearNode = (node: Element): void => node.replaceChildren();
 
 function errorText(error: unknown): string {
@@ -139,6 +149,7 @@ function setState(title: string, detail: string, mode: "loading" | "empty" | "er
   stateView.append(heading, paragraph);
   stateView.hidden = false;
   historyList.hidden = true;
+  syncPreview(null);
 }
 
 function applySettings(config: Config): void {
@@ -251,6 +262,7 @@ function renderSelection(scroll = false): void {
   ocrDetail.textContent = selected?.kind === "image"
     ? selected.ocr_error || ocrLabel(selected.ocr_status)?.label || "本地图片"
     : "Windows.Media.Ocr";
+  syncPreview(mode === "clipboard" && !panelOpen && !snippetEditor.open ? selectedId : null);
 }
 
 function selectEntry(id: number, scroll: boolean): void {
@@ -337,6 +349,7 @@ function moveSelection(direction: 1 | -1): void {
 async function pasteSelected(): Promise<void> {
   if (!hasNativeBackend || selectedId === null || pasteInFlight || snippetEditor.open || searchInput.value.trim() !== displayedQuery) return;
   pasteInFlight = true;
+  ++previewRevision;
   root.classList.add("is-pasting");
   historyRegion.setAttribute("aria-busy", "true");
   searchStatus.textContent = "正在粘贴…";
@@ -355,6 +368,7 @@ async function pasteSelected(): Promise<void> {
 
 async function hidePopup(): Promise<void> {
   if (!hasNativeBackend) return;
+  ++previewRevision;
   try {
     await invoke("hide_popup");
   } catch (error) {
@@ -364,6 +378,7 @@ async function hidePopup(): Promise<void> {
 
 function openSettings(): void {
   panelOpen = true;
+  syncPreview(null);
   settingsPanel.hidden = false;
   settingsScrim.hidden = false;
   settingsToggle.setAttribute("aria-expanded", "true");
@@ -380,6 +395,7 @@ function closeSettings(restoreFocus = true): void {
   settingsPanel.hidden = true;
   settingsScrim.hidden = true;
   if (restoreFocus) settingsToggle.focus();
+  renderSelection();
 }
 
 async function runConfigAction(command: "open_config" | "reload_config"): Promise<void> {

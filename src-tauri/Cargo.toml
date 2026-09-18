@@ -13,6 +13,7 @@ serde_yaml = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sha2 = "0.10"
+pinyin = { version = "0.10", default-features = false, features = ["plain"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
