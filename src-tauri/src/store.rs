@@ -31,6 +31,7 @@ pub struct Entry {
     pub height: Option<u32>,
     pub ocr_status: String,
     pub ocr_error: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,7 +41,18 @@ pub struct Snippet {
     pub content: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub tags: Vec<String>,
 }
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct TagCount {
+    pub name: String,
+    pub count: usize,
+}
+
+const MAX_TAGS: usize = 12;
+const MAX_TAG_CHARS: usize = 24;
+const MAX_SEARCH_TERMS: usize = 8;
 
 fn snippet_from_row(row: &Row<'_>) -> rusqlite::Result<Snippet> {
     Ok(Snippet {
@@ -49,7 +61,115 @@ fn snippet_from_row(row: &Row<'_>) -> rusqlite::Result<Snippet> {
         content: row.get(2)?,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
+        tags: decode_tags(&row.get::<_, String>(5)?),
     })
+}
+
+/// 把用户输入的标签整理成去重、去掉 `#` 前缀的列表。
+pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut result: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.trim().trim_start_matches('#').trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_CHARS {
+            return Err(format!("标签“{tag}”过长，最多 {MAX_TAG_CHARS} 个字符"));
+        }
+        if tag
+            .chars()
+            .any(|c| c == ',' || c == '，' || c.is_control() || c.is_whitespace())
+        {
+            return Err(format!("标签“{tag}”不能包含逗号、空格或控制字符"));
+        }
+        if !result.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+            result.push(tag.to_string());
+        }
+    }
+    if result.len() > MAX_TAGS {
+        return Err(format!("每条记录最多 {MAX_TAGS} 个标签"));
+    }
+    Ok(result)
+}
+
+fn encode_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!(",{},", tags.join(","))
+    }
+}
+
+fn decode_tags(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// 把搜索框内容按空白拆成多个关键词，每个关键词都必须命中（AND）。
+fn search_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in query.split_whitespace() {
+        if !terms.iter().any(|t| t.to_lowercase() == term.to_lowercase()) {
+            terms.push(term.to_string());
+        }
+        if terms.len() == MAX_SEARCH_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
+fn tag_like_pattern(tag: &str) -> String {
+    let mut pattern = String::from("%,");
+    for character in tag.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push_str(",%");
+    pattern
+}
+
+/// 生成 `(c1 LIKE ?n OR c2 LIKE ?n) AND ...` 条件，参数追加到 `params`。
+fn push_search_conditions(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<String>,
+    columns: &[&str],
+    query: &str,
+    tag: Option<&str>,
+) {
+    for term in search_terms(query) {
+        params.push(literal_like_pattern(&term));
+        let index = params.len();
+        let alternatives = columns
+            .iter()
+            .map(|column| format!("{column} LIKE ?{index} ESCAPE '\\' COLLATE NOCASE"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        conditions.push(format!("({alternatives})"));
+    }
+    if let Some(tag) = tag.map(str::trim).filter(|tag| !tag.is_empty()) {
+        params.push(tag_like_pattern(tag.trim_start_matches('#')));
+        conditions.push(format!(
+            "tags LIKE ?{} ESCAPE '\\' COLLATE NOCASE",
+            params.len()
+        ));
+    }
 }
 
 pub struct Store {
@@ -155,6 +275,15 @@ impl Store {
             transaction.commit().map_err(|e| e.to_string())?;
         }
 
+        for table in ["entries", "snippets"] {
+            if !has_column(&conn, table, "tags")? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN tags TEXT NOT NULL DEFAULT '';"
+                ))
+                .map_err(|e| format!("无法升级标签字段：{e}"))?;
+            }
+        }
+
         let mut store = Self {
             conn,
             max_items,
@@ -166,13 +295,35 @@ impl Store {
         Ok(store)
     }
 
-    pub fn list_snippets(&self, query: &str, limit: usize) -> Result<Vec<Snippet>, String> {
-        let mut statement = self.conn.prepare(r"SELECT id,title,'',created_at,updated_at FROM snippets WHERE title LIKE ?1 ESCAPE '\' COLLATE NOCASE ORDER BY updated_at DESC,id DESC LIMIT ?2").map_err(|e| e.to_string())?;
+    pub fn list_snippets(
+        &self,
+        query: &str,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Snippet>, String> {
+        let mut conditions = Vec::new();
+        let mut values = Vec::new();
+        push_search_conditions(
+            &mut conditions,
+            &mut values,
+            &["title", "content", "tags"],
+            query,
+            tag,
+        );
+        values.push((limit.clamp(1, 100) as i64).to_string());
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id,title,'',created_at,updated_at,tags FROM snippets {where_clause}
+             ORDER BY updated_at DESC,id DESC LIMIT CAST(?{} AS INTEGER)",
+            values.len()
+        );
+        let mut statement = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map(
-                params![literal_like_pattern(query), limit.clamp(1, 100) as i64],
-                snippet_from_row,
-            )
+            .query_map(rusqlite::params_from_iter(values.iter()), snippet_from_row)
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
@@ -181,7 +332,7 @@ impl Store {
     pub fn get_snippet(&self, id: i64) -> Result<Snippet, String> {
         self.conn
             .query_row(
-                "SELECT id,title,content,created_at,updated_at FROM snippets WHERE id=?1",
+                "SELECT id,title,content,created_at,updated_at,tags FROM snippets WHERE id=?1",
                 [id],
                 snippet_from_row,
             )
@@ -195,7 +346,9 @@ impl Store {
         id: Option<i64>,
         title: &str,
         content: &str,
+        tags: &[String],
     ) -> Result<i64, String> {
+        let tags = encode_tags(&normalize_tags(tags)?);
         let title = title.trim();
         if title.is_empty() || title.chars().count() > 200 {
             return Err("片段标题需要 1 到 200 个字符".into());
@@ -218,13 +371,13 @@ impl Store {
         let timestamp = now.max(newest.saturating_add(1));
         let result = if let Some(id) = id {
             self.conn.execute(
-                "UPDATE snippets SET title=?1,content=?2,updated_at=?3 WHERE id=?4",
-                params![title, content, timestamp, id],
+                "UPDATE snippets SET title=?1,content=?2,updated_at=?3,tags=?5 WHERE id=?4",
+                params![title, content, timestamp, id, tags],
             )
         } else {
             self.conn.execute(
-                "INSERT INTO snippets(title,content,created_at,updated_at) VALUES(?1,?2,?3,?3)",
-                params![title, content, timestamp],
+                "INSERT INTO snippets(title,content,created_at,updated_at,tags) VALUES(?1,?2,?3,?3,?4)",
+                params![title, content, timestamp, tags],
             )
         }
         .map_err(|e| format!("无法保存片段（标题不能重复）：{e}"))?;
@@ -241,33 +394,36 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    pub fn list(&self, query: &str, limit: usize) -> Result<Vec<Entry>, String> {
+    pub fn list(&self, query: &str, tag: Option<&str>, limit: usize) -> Result<Vec<Entry>, String> {
         let limit = limit.clamp(1, 100) as i64;
-        let (sql, pattern) = if query.is_empty() {
-            (
-                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error
-                 FROM entries ORDER BY created_at DESC, id DESC LIMIT ?1",
-                None,
-            )
+        let mut conditions = Vec::new();
+        let mut values = Vec::new();
+        push_search_conditions(
+            &mut conditions,
+            &mut values,
+            &["text", "pinyin", "tags"],
+            query,
+            tag,
+        );
+        values.push(limit.to_string());
+        let where_clause = if conditions.is_empty() {
+            String::new()
         } else {
-            (
-                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error
-                 FROM entries
-                 WHERE text LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-                    OR pinyin LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-                 ORDER BY created_at DESC, id DESC LIMIT ?2",
-                Some(literal_like_pattern(query)),
-            )
+            format!("WHERE {}", conditions.join(" AND "))
         };
+        let sql = format!(
+            "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error, tags
+             FROM entries {where_clause}
+             ORDER BY created_at DESC, id DESC LIMIT CAST(?{} AS INTEGER)",
+            values.len()
+        );
         let mut statement = self
             .conn
-            .prepare(sql)
+            .prepare(&sql)
             .map_err(|error| format!("无法准备历史查询：{error}"))?;
-        let mut rows = match pattern.as_ref() {
-            Some(pattern) => statement.query(params![pattern, limit]),
-            None => statement.query(params![limit]),
-        }
-        .map_err(|error| format!("无法查询历史记录：{error}"))?;
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(values.iter()))
+            .map_err(|error| format!("无法查询历史记录：{error}"))?;
 
         let mut entries = Vec::with_capacity(limit as usize);
         while let Some(row) = rows
@@ -285,7 +441,7 @@ impl Store {
     pub fn get(&self, id: i64) -> Result<Entry, String> {
         self.conn
             .query_row(
-                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error
+                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error, tags
                  FROM entries WHERE id = ?1",
                 params![id],
                 entry_from_row,
@@ -298,7 +454,7 @@ impl Store {
     pub fn pending_image(&self) -> Result<Option<Entry>, String> {
         self.conn
             .query_row(
-                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error
+                "SELECT id, kind, text, summary, image_path, thumbnail_path, created_at, width, height, ocr_status, ocr_error, tags
                  FROM entries WHERE kind = 'image' AND ocr_status = 'pending'
                  ORDER BY created_at ASC, id ASC LIMIT 1",
                 [],
@@ -503,6 +659,45 @@ impl Store {
             .map_err(|error| format!("无法清空历史记录：{error}"))?;
         cleanup_directory(&self.images_dir, &HashSet::new())?;
         cleanup_directory(&self.thumbnails_dir, &HashSet::new())
+    }
+
+    pub fn set_entry_tags(&mut self, id: i64, tags: &[String]) -> Result<Vec<String>, String> {
+        let tags = normalize_tags(tags)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE entries SET tags = ?1 WHERE id = ?2",
+                params![encode_tags(&tags), id],
+            )
+            .map_err(|error| format!("无法保存标签：{error}"))?;
+        if changed == 0 {
+            return Err("记录不存在或已被删除".into());
+        }
+        Ok(tags)
+    }
+
+    /// 列出某个范围（历史或片段）用到的所有标签及次数，按次数降序。
+    pub fn list_tags(&self, snippets: bool) -> Result<Vec<TagCount>, String> {
+        let table = if snippets { "snippets" } else { "entries" };
+        let mut statement = self
+            .conn
+            .prepare(&format!("SELECT tags FROM {table} WHERE tags <> ''"))
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut counts: Vec<TagCount> = Vec::new();
+        for row in rows {
+            for tag in decode_tags(&row.map_err(|e| e.to_string())?) {
+                let key = tag.to_lowercase();
+                match counts.iter_mut().find(|item| item.name.to_lowercase() == key) {
+                    Some(item) => item.count += 1,
+                    None => counts.push(TagCount { name: tag, count: 1 }),
+                }
+            }
+        }
+        counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        Ok(counts)
     }
 
     pub fn set_max_items(&mut self, max_items: usize) -> Result<(), String> {
@@ -712,6 +907,7 @@ fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<Entry> {
         height: row.get(8)?,
         ocr_status: row.get(9)?,
         ocr_error: row.get(10)?,
+        tags: decode_tags(&row.get::<_, String>(11)?),
     })
 }
 
@@ -934,19 +1130,19 @@ mod tests {
         let mut store = Store::open(dir.path(), 100).unwrap();
         assert_eq!(
             store
-                .list("NIHAO", 20)
+                .list("NIHAO", None, 20)
                 .unwrap()
                 .iter()
                 .map(|e| e.id)
                 .collect::<Vec<_>>(),
             [image, text]
         );
-        assert_eq!(store.list("nihao Rust 100%_", 20).unwrap()[0].id, text);
-        assert_eq!(store.list("你好", 1).unwrap()[0].id, image);
+        assert_eq!(store.list("nihao Rust 100%_", None, 20).unwrap()[0].id, text);
+        assert_eq!(store.list("你好", None, 1).unwrap()[0].id, image);
         store.retry_ocr(image).unwrap();
         assert_eq!(
             store
-                .list("nihao", 20)
+                .list("nihao", None, 20)
                 .unwrap()
                 .iter()
                 .map(|e| e.id)
@@ -954,9 +1150,9 @@ mod tests {
             [text]
         );
         store.update_ocr(image, "再见", "ready", None).unwrap();
-        assert_eq!(store.list("zaijian", 20).unwrap()[0].id, image);
+        assert_eq!(store.list("zaijian", None, 20).unwrap()[0].id, image);
         let fresh = store.insert_text("你好新记录").unwrap();
-        assert_eq!(store.list("nihao", 1).unwrap()[0].id, fresh);
+        assert_eq!(store.list("nihao", None, 1).unwrap()[0].id, fresh);
     }
 
     #[test]
@@ -967,20 +1163,20 @@ mod tests {
         for index in 0..30 {
             store.insert_text(&format!("记录{index}")).unwrap();
         }
-        assert!(!store.list("", 20).unwrap().iter().any(|e| e.id == old));
-        assert_eq!(store.list("隐藏", 20).unwrap()[0].id, old);
+        assert!(!store.list("", None, 20).unwrap().iter().any(|e| e.id == old));
+        assert_eq!(store.list("隐藏", None, 20).unwrap()[0].id, old);
         store.touch(old).unwrap();
-        assert_eq!(store.list("", 10).unwrap()[0].id, old);
+        assert_eq!(store.list("", None, 10).unwrap()[0].id, old);
         assert_eq!(store.insert_text("隐藏的旧记录").unwrap(), old);
-        assert_eq!(store.list("", 100).unwrap().len(), 31);
+        assert_eq!(store.list("", None, 100).unwrap().len(), 31);
         let image = store.insert_image(&[0, 0, 0, 255], 1, 1).unwrap();
         store.touch(old).unwrap();
         assert_eq!(store.insert_image(&[0, 0, 0, 255], 1, 1).unwrap(), image);
-        assert_eq!(store.list("", 10).unwrap()[0].id, image);
-        assert_eq!(store.list("", 100).unwrap().len(), 32);
+        assert_eq!(store.list("", None, 10).unwrap()[0].id, image);
+        assert_eq!(store.list("", None, 100).unwrap().len(), 32);
         store.delete(old).unwrap();
         assert!(store.touch(old).is_err());
-        assert!(store.list("隐藏", 20).unwrap().is_empty());
+        assert!(store.list("隐藏", None, 20).unwrap().is_empty());
     }
 
     #[test]
@@ -1026,21 +1222,66 @@ mod tests {
             .insert_text("中文进度 100xx完成 alpha")
             .expect("insert second");
 
-        let literal = store.list("100%_", 20).expect("literal search");
+        let literal = store.list("100%_", None, 20).expect("literal search");
         assert_eq!(
             literal.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             [first]
         );
-        assert_eq!(store.list("ALPHA", 20).expect("case search").len(), 2);
+        assert_eq!(store.list("ALPHA", None, 20).expect("case search").len(), 2);
 
         let duplicate = store
             .insert_text("中文进度 100%_完成 Alpha")
             .expect("deduplicate");
         assert_eq!(duplicate, first);
-        let entries = store.list("", 20).expect("list history");
+        let entries = store.list("", None, 20).expect("list history");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, first);
         assert_eq!(entries[1].id, second);
+    }
+
+    #[test]
+    fn multi_term_search_requires_every_term_and_tags_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        let abc = store.insert_text("alpha beta gamma").unwrap();
+        let ab = store.insert_text("alpha beta").unwrap();
+        let chinese = store.insert_text("你好 世界 rust").unwrap();
+        let ids = |entries: Vec<Entry>| entries.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.list("alpha  beta", None, 20).unwrap()), [ab, abc]);
+        assert_eq!(ids(store.list("gamma alpha beta", None, 20).unwrap()), [abc]);
+        assert_eq!(ids(store.list("nihao RUST", None, 20).unwrap()), [chinese]);
+        assert!(store.list("alpha rust", None, 20).unwrap().is_empty());
+
+        assert_eq!(
+            store
+                .set_entry_tags(abc, &["#工作".into(), "code".into(), "CODE".into(), " ".into()])
+                .unwrap(),
+            ["工作", "code"]
+        );
+        store.set_entry_tags(ab, &["code".into()]).unwrap();
+        assert!(store.set_entry_tags(ab, &["a,b".into()]).is_err());
+        assert_eq!(ids(store.list("", Some("Code"), 20).unwrap()), [ab, abc]);
+        assert_eq!(ids(store.list("gamma", Some("code"), 20).unwrap()), [abc]);
+        assert_eq!(ids(store.list("工作", None, 20).unwrap()), [abc]);
+        assert!(store.list("", Some("cod"), 20).unwrap().is_empty());
+        assert_eq!(store.get(abc).unwrap().tags, ["工作", "code"]);
+        assert_eq!(
+            store.list_tags(false).unwrap(),
+            [
+                TagCount { name: "code".into(), count: 2 },
+                TagCount { name: "工作".into(), count: 1 }
+            ]
+        );
+
+        let snippet = store
+            .upsert_snippet(None, "签名", "Best regards\nLi", &["邮件".into()])
+            .unwrap();
+        store.upsert_snippet(None, "地址", "上海市", &[]).unwrap();
+        let found = store.list_snippets("best li", None, 20).unwrap();
+        assert_eq!(found.iter().map(|s| s.id).collect::<Vec<_>>(), [snippet]);
+        assert_eq!(store.list_snippets("", Some("邮件"), 20).unwrap().len(), 1);
+        assert_eq!(store.get_snippet(snippet).unwrap().tags, ["邮件"]);
+        assert_eq!(store.list_tags(true).unwrap()[0].name, "邮件");
     }
 
     #[test]
@@ -1061,9 +1302,9 @@ mod tests {
         assert!(store.get(image_id).is_err());
         assert!(!image_path.exists());
         assert!(!thumbnail_path.exists());
-        assert_eq!(store.list("", 20).expect("list pruned").len(), 2);
+        assert_eq!(store.list("", None, 20).expect("list pruned").len(), 2);
 
         store.set_max_items(1).expect("shrink retention");
-        assert_eq!(store.list("", 20).expect("list shrunk").len(), 1);
+        assert_eq!(store.list("", None, 20).expect("list shrunk").len(), 1);
     }
 }

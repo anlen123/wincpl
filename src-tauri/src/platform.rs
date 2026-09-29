@@ -320,19 +320,35 @@ pub fn show_preview(
         return Err("无法读取预览显示器工作区".into());
     }
     let scale = main.scale_factor().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
     let gap = (16.0 * scale).round() as i32;
     let work = info.rcWork;
-    let width = ((480.0 * scale).round() as i32).min((work.right - work.left - 2 * gap).max(1));
-    let height = ((560.0 * scale).round() as i32).min((work.bottom - work.top - 2 * gap).max(1));
+    let rect = crate::layout::preview_rect(
+        crate::layout::Rect {
+            left: work.left,
+            top: work.top,
+            right: work.right,
+            bottom: work.bottom,
+        },
+        crate::layout::Rect::new(
+            position.x,
+            position.y,
+            size.width as i32,
+            size.height as i32,
+        ),
+        (480.0 * scale).round() as i32,
+        (560.0 * scale).round() as i32,
+        gap,
+    );
     let hwnd = preview.hwnd().map_err(|e| e.to_string())?;
     unsafe {
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
-            work.right - width - gap,
-            work.bottom - height - gap,
-            width,
-            height,
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
             SWP_NOACTIVATE,
         )
         .map_err(|e| e.to_string())?;

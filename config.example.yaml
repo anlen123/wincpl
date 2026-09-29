@@ -13,7 +13,7 @@ hotkeys:
   # 推荐 Ctrl+Alt+字母，示例 Ctrl+Alt+V、Ctrl+Alt+C；避免和其他软件冲突。
   # 两个呼出键不能相同；修改时允许互换两个面板的组合。
   toggle: "Ctrl+Alt+V" # 剪贴板历史，支持正文/OCR 文字与无声调全拼搜索（nihao）。
-  snippets: "Ctrl+Alt+S" # 代码片段，搜索标题，粘贴保存的完整内容。
+  snippets: "Ctrl+Alt+S" # 代码片段，搜索标题/正文/标签，粘贴保存的完整内容。
   # 下面不是呼出键，也不是在面板中按的按键：它是选中后发送给目标软件的组合。
   # 面板仍用上下键选择、Enter 或左键粘贴、Esc 隐藏。
   # Shift+Insert 适合部分终端；普通软件可改 Ctrl+V。目标软件必须支持该组合。

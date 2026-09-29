@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod app;
 mod config;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod layout;
 mod ocr;
 #[cfg(windows)]
 mod platform;

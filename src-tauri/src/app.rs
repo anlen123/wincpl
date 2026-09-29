@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     platform,
-    store::{Entry, Snippet, Store},
+    store::{Entry, Snippet, Store, TagCount},
 };
 use std::{
     borrow::Cow,
@@ -95,14 +95,18 @@ fn get_popup_mode(state: tauri::State<AppState>) -> &'static str {
 }
 
 #[tauri::command]
-async fn list_entries(app: tauri::AppHandle, query: String) -> Result<Vec<Entry>, String> {
-    if query.len() > 4096 {
+async fn list_entries(
+    app: tauri::AppHandle,
+    query: String,
+    tag: Option<String>,
+) -> Result<Vec<Entry>, String> {
+    if query.len() > 4096 || tag.as_ref().is_some_and(|tag| tag.len() > 256) {
         return Err("搜索内容过长".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let limit = lock(&state.config)?.history.display_limit;
-        let result = lock(&state.store)?.list(&query, limit);
+        let result = lock(&state.store)?.list(&query, tag.as_deref(), limit);
         result
     })
     .await
@@ -135,13 +139,31 @@ fn get_preview(state: tauri::State<AppState>) -> Result<Option<Entry>, String> {
 fn select_preview(app: tauri::AppHandle, id: Option<i64>) -> Result<(), String> {
     let main = window(&app)?;
     let state = app.state::<AppState>();
-    if id.is_none()
-        || !main.is_visible().map_err(|e| e.to_string())?
-        || state.snippet_mode.load(Ordering::Acquire)
-    {
+    let Some(id) = id else {
+        return clear_preview(&app);
+    };
+    if !main.is_visible().map_err(|e| e.to_string())? {
         return clear_preview(&app);
     }
-    let entry = lock(&state.store)?.get(id.unwrap())?;
+    let entry = if state.snippet_mode.load(Ordering::Acquire) {
+        let snippet = lock(&state.store)?.get_snippet(id)?;
+        Entry {
+            id: snippet.id,
+            kind: "snippet".into(),
+            summary: snippet.title,
+            text: snippet.content,
+            image_path: None,
+            thumbnail_path: None,
+            created_at: snippet.updated_at * 1000,
+            width: None,
+            height: None,
+            ocr_status: "none".into(),
+            ocr_error: None,
+            tags: snippet.tags,
+        }
+    } else {
+        lock(&state.store)?.get(id)?
+    };
     *lock(&state.preview)? = Some(entry);
     let preview = app.get_webview_window("preview").ok_or("预览窗口不存在")?;
     preview
@@ -218,8 +240,20 @@ fn shortcuts(config: &Config) -> Result<[Shortcut; 2], String> {
 
 #[tauri::command]
 fn reload_config(app: tauri::AppHandle) -> Result<Config, String> {
+    let next = Config::load(&app.state::<AppState>().config_path)?;
+    apply_config(&app, next, false)
+}
+
+/// 在设置面板中直接修改配置：先校验并应用，成功后写回 YAML（保留注释）。
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, config: Config) -> Result<Config, String> {
+    config.validate()?;
+    apply_config(&app, config, true)
+}
+
+fn apply_config(app: &tauri::AppHandle, next: Config, persist: bool) -> Result<Config, String> {
+    let app = app.clone();
     let state = app.state::<AppState>();
-    let next = Config::load(&state.config_path)?;
     platform::validate_chord(&next.hotkeys.paste)?;
     let new = shortcuts(&next)?;
     let mut current = lock(&state.config)?;
@@ -241,6 +275,9 @@ fn reload_config(app: tauri::AppHandle) -> Result<Config, String> {
                 next.appearance.height,
             ))
             .map_err(|e| e.to_string())?;
+        if persist {
+            next.save(&state.config_path)?;
+        }
         lock(&state.store)?.set_max_items(next.history.max_items)?;
         for shortcut in old.iter().filter(|s| !new.contains(s)) {
             app.global_shortcut()
@@ -275,12 +312,16 @@ fn reload_config(app: tauri::AppHandle) -> Result<Config, String> {
 }
 
 #[tauri::command]
-fn list_snippets(state: tauri::State<AppState>, query: String) -> Result<Vec<Snippet>, String> {
-    if query.len() > 4096 {
+fn list_snippets(
+    state: tauri::State<AppState>,
+    query: String,
+    tag: Option<String>,
+) -> Result<Vec<Snippet>, String> {
+    if query.len() > 4096 || tag.as_ref().is_some_and(|tag| tag.len() > 256) {
         return Err("搜索内容过长".into());
     }
     let limit = lock(&state.config)?.history.display_limit;
-    let result = lock(&state.store)?.list_snippets(&query, limit);
+    let result = lock(&state.store)?.list_snippets(&query, tag.as_deref(), limit);
     result
 }
 
@@ -295,11 +336,33 @@ fn save_snippet(
     id: Option<i64>,
     title: String,
     content: String,
+    tags: Option<Vec<String>>,
 ) -> Result<i64, String> {
-    let id = lock(&app.state::<AppState>().store)?.upsert_snippet(id, &title, &content)?;
+    let id = lock(&app.state::<AppState>().store)?.upsert_snippet(
+        id,
+        &title,
+        &content,
+        &tags.unwrap_or_default(),
+    )?;
     app.emit("snippets-changed", ())
         .map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+#[tauri::command]
+fn set_entry_tags(
+    app: tauri::AppHandle,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let tags = lock(&app.state::<AppState>().store)?.set_entry_tags(id, &tags)?;
+    app.emit("history-changed", ()).map_err(|e| e.to_string())?;
+    Ok(tags)
+}
+
+#[tauri::command]
+fn list_tags(state: tauri::State<AppState>, snippets: bool) -> Result<Vec<TagCount>, String> {
+    lock(&state.store)?.list_tags(snippets)
 }
 
 #[tauri::command]
@@ -569,7 +632,10 @@ pub fn run() {
             clear_history,
             retry_ocr,
             open_config,
-            reload_config
+            reload_config,
+            save_settings,
+            set_entry_tags,
+            list_tags
         ])
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
