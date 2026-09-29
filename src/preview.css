@@ -23,4 +23,11 @@
 #preview-image { display: block; width: 100%; height: 100%; object-fit: contain; }
 #preview-content.actual-size #preview-image { width: auto; height: auto; max-width: none; max-height: none; }
 #preview-status { color: var(--muted-color); line-height: 1.6; }
+.preview-hit {
+  padding: 0 1px; border-radius: 3px;
+  color: var(--text-color);
+  background: color-mix(in srgb, var(--accent-color) 32%, transparent);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent-color) 60%, transparent);
+}
+.preview-shell h1 .preview-hit, .preview-tags .preview-hit { padding: 0 2px; }
 .preview-shell footer { display: flex; justify-content: space-between; align-items: center; padding: 0 16px; border-top: 1px solid var(--border-color); font-size: 11px; color: var(--muted-color); gap: 10px; }

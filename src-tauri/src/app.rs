@@ -28,6 +28,32 @@ struct AppState {
     last_error: Mutex<Option<String>>,
     snippet_mode: AtomicBool,
     preview: Mutex<Option<Entry>>,
+    preview_terms: Mutex<Vec<String>>,
+}
+
+/// 预览窗口返回的数据：条目本身，加上当前搜索关键词，用于在浮窗内高亮。
+#[derive(Clone, serde::Serialize)]
+struct PreviewPayload {
+    entry: Option<Entry>,
+    terms: Vec<String>,
+}
+
+/// 把搜索框内容拆成用于高亮的关键词：按空白分隔、转小写、去重并限制数量。
+fn preview_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in query.split_whitespace() {
+        if term.is_empty() || term.chars().count() > 64 {
+            continue;
+        }
+        let lowered = term.to_lowercase();
+        if !terms.contains(&lowered) {
+            terms.push(lowered);
+        }
+        if terms.len() >= 8 {
+            break;
+        }
+    }
+    terms
 }
 
 fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
@@ -120,7 +146,9 @@ fn hide_popup(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn clear_preview(app: &tauri::AppHandle) -> Result<(), String> {
-    *lock(&app.state::<AppState>().preview)? = None;
+    let state = app.state::<AppState>();
+    *lock(&state.preview)? = None;
+    *lock(&state.preview_terms)? = Vec::new();
     if let Some(preview) = app.get_webview_window("preview") {
         platform::hide_preview(&preview)?;
         preview
@@ -131,17 +159,25 @@ fn clear_preview(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_preview(state: tauri::State<AppState>) -> Result<Option<Entry>, String> {
-    Ok(lock(&state.preview)?.clone())
+fn get_preview(state: tauri::State<AppState>) -> Result<PreviewPayload, String> {
+    Ok(PreviewPayload {
+        entry: lock(&state.preview)?.clone(),
+        terms: lock(&state.preview_terms)?.clone(),
+    })
 }
 
 #[tauri::command]
-fn select_preview(app: tauri::AppHandle, id: Option<i64>) -> Result<(), String> {
+fn select_preview(
+    app: tauri::AppHandle,
+    id: Option<i64>,
+    query: Option<String>,
+) -> Result<(), String> {
     let main = window(&app)?;
     let state = app.state::<AppState>();
     let Some(id) = id else {
         return clear_preview(&app);
     };
+    *lock(&state.preview_terms)? = preview_terms(query.as_deref().unwrap_or_default());
     if !main.is_visible().map_err(|e| e.to_string())? {
         return clear_preview(&app);
     }
@@ -657,6 +693,7 @@ pub fn run() {
                 last_error: Mutex::new(None),
                 snippet_mode: AtomicBool::new(false),
                 preview: Mutex::new(None),
+                preview_terms: Mutex::new(Vec::new()),
             });
             let popup = window(app.handle())?;
             popup.set_size(tauri::LogicalSize::new(

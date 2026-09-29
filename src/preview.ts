@@ -14,6 +14,7 @@ type Preview = {
   created_at: number;
   tags?: string[];
 };
+type PreviewPayload = { entry: Preview | null; terms: string[] };
 const title = document.getElementById("preview-title")!;
 const eyebrow = document.getElementById("preview-eyebrow")!;
 const tagsRow = document.getElementById("preview-tags")!;
@@ -29,6 +30,41 @@ function countLines(value: string): number {
   return value ? value.split(/\r\n|\r|\n/).length : 0;
 }
 
+/** 把文本按关键词切分并生成高亮 span，避免使用 innerHTML 带来的注入风险。 */
+function renderHighlighted(target: HTMLElement, value: string, terms: string[]): void {
+  const needles = terms.filter(Boolean);
+  if (needles.length === 0 || !value) {
+    target.textContent = value;
+    return;
+  }
+  const lower = value.toLowerCase();
+  const nodes: Node[] = [];
+  let cursor = 0;
+  while (cursor < value.length) {
+    let bestStart = -1;
+    let bestLength = 0;
+    for (const needle of needles) {
+      const at = lower.indexOf(needle, cursor);
+      if (at < 0) continue;
+      if (bestStart < 0 || at < bestStart || (at === bestStart && needle.length > bestLength)) {
+        bestStart = at;
+        bestLength = needle.length;
+      }
+    }
+    if (bestStart < 0) {
+      nodes.push(document.createTextNode(value.slice(cursor)));
+      break;
+    }
+    if (bestStart > cursor) nodes.push(document.createTextNode(value.slice(cursor, bestStart)));
+    const mark = document.createElement("mark");
+    mark.className = "preview-hit";
+    mark.textContent = value.slice(bestStart, bestStart + bestLength);
+    nodes.push(mark);
+    cursor = bestStart + bestLength;
+  }
+  target.replaceChildren(...nodes);
+}
+
 function renderTags(tags: string[]): void {
   tagsRow.replaceChildren(...tags.map((tag) => {
     const chip = document.createElement("span");
@@ -38,7 +74,9 @@ function renderTags(tags: string[]): void {
   tagsRow.hidden = tags.length === 0;
 }
 
-function render(entry: Preview | null): void {
+function render(payload: PreviewPayload): void {
+  const entry = payload.entry;
+  const terms = payload.terms ?? [];
   image.removeAttribute("src");
   image.hidden = text.hidden = scale.hidden = true;
   text.textContent = "";
@@ -57,20 +95,20 @@ function render(entry: Preview | null): void {
   }
   if (entry.kind === "image" && entry.image_path) {
     eyebrow.textContent = "剪藏 / 图片";
-    title.textContent = "图片预览";
+    renderHighlighted(title, "图片预览", terms);
     meta.textContent = `${entry.width} × ${entry.height} · 原图`;
     image.src = convertFileSrc(entry.image_path);
     image.hidden = scale.hidden = false;
   } else if (entry.kind === "snippet") {
     eyebrow.textContent = "剪藏 / 代码片段";
-    title.textContent = entry.summary || "代码片段";
-    text.textContent = entry.text;
+    renderHighlighted(title, entry.summary || "代码片段", terms);
+    renderHighlighted(text, entry.text, terms);
     text.hidden = false;
     meta.textContent = `${countLines(entry.text)} 行 · ${entry.text.length} 字符 · Enter 粘贴`;
   } else {
     eyebrow.textContent = "剪藏 / 文字";
-    title.textContent = "文字预览";
-    text.textContent = entry.text;
+    renderHighlighted(title, "文字预览", terms);
+    renderHighlighted(text, entry.text, terms);
     text.hidden = false;
     meta.textContent = `${countLines(entry.text)} 行 · ${entry.text.length} 字符`;
   }
@@ -78,11 +116,12 @@ function render(entry: Preview | null): void {
 async function refresh(): Promise<void> {
   const current = ++version;
   try {
-    const entry = await invoke<Preview | null>("get_preview");
-    if (current === version) render(entry);
+    const payload = await invoke<PreviewPayload>("get_preview");
+    if (current === version) render(payload ?? { entry: null, terms: [] });
   } catch (error) {
     if (current !== version) return;
-    render(null); status.textContent = String(error);
+    render({ entry: null, terms: [] });
+    status.textContent = String(error);
   }
 }
 function applyAppearance(config: { appearance: Record<string, string | number> }): void {

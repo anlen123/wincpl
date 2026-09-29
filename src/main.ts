@@ -129,11 +129,11 @@ let resetSelectionPending = true;
 let previewQueue: Promise<unknown> = Promise.resolve();
 let previewRevision = 0;
 
-function syncPreview(id: number | null): void {
+function syncPreview(id: number | null, query: string): void {
   if (!hasNativeBackend) return;
   const revision = ++previewRevision;
   previewQueue = previewQueue.then(async () => {
-    if (revision === previewRevision) await invoke("select_preview", { id });
+    if (revision === previewRevision) await invoke("select_preview", { id, query });
   }).catch(showError);
 }
 const clearNode = (node: Element): void => node.replaceChildren();
@@ -192,7 +192,7 @@ function setState(title: string, detail: string, stateMode: "loading" | "empty" 
   stateView.append(heading, paragraph);
   stateView.hidden = false;
   historyList.hidden = true;
-  syncPreview(null);
+  syncPreview(null, "");
 }
 
 const displayChord = (value: string): string => value.replace(/Super|Meta/gi, "Win");
@@ -353,7 +353,7 @@ function renderSelection(scroll = false): void {
     ? selected.ocr_error || ocrLabel(selected.ocr_status)?.label || "本地图片"
     : "使用 Windows.Media.Ocr 离线识别图片文字，识别结果可参与搜索。";
   // 剪贴板与代码片段都在屏幕角落显示完整预览；有弹层时收起，避免遮挡。
-  syncPreview(!panelOpen && !dialogOpen() ? selectedId : null);
+  syncPreview(!panelOpen && !dialogOpen() ? selectedId : null, displayedQuery);
 }
 
 function selectEntry(id: number, scroll: boolean): void {
@@ -879,7 +879,7 @@ async function saveSettings(): Promise<void> {
 function openSettings(): void {
   if (dialogOpen()) return;
   panelOpen = true;
-  syncPreview(null);
+  syncPreview(null, "");
   if (currentConfig) fillSettingsForm(currentConfig);
   settingsPanel.hidden = false;
   settingsScrim.hidden = false;
