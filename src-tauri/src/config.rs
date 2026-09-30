@@ -20,6 +20,8 @@ pub struct Config {
     pub ocr: Ocr,
     #[serde(default)]
     pub notify: Notify,
+    #[serde(default)]
+    pub phone: Phone,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -102,6 +104,49 @@ fn default_notify_duration() -> u32 {
 const MIN_NOTIFY_MS: u32 = 600;
 const MAX_NOTIFY_MS: u32 = 8_000;
 
+/// 手机短信验证码接入：局域网监听、配对令牌与验证码保留时长。
+/// 旧配置缺少该段落时使用默认值（默认关闭，避免升级后突然对外监听）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Phone {
+    #[serde(default = "default_phone_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_phone_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_code_ttl")]
+    pub code_ttl_secs: u32,
+}
+
+impl Default for Phone {
+    fn default() -> Self {
+        Self {
+            enabled: default_phone_enabled(),
+            port: default_phone_port(),
+            token: String::new(),
+            code_ttl_secs: default_code_ttl(),
+        }
+    }
+}
+
+fn default_phone_enabled() -> bool {
+    false
+}
+
+fn default_phone_port() -> u16 {
+    8788
+}
+
+fn default_code_ttl() -> u32 {
+    300
+}
+
+/// 1024 以下在 Windows 上需要管理员权限，因此不允许配置。
+const MIN_PHONE_PORT: u16 = 1_024;
+const MIN_CODE_TTL: u32 = 30;
+const MAX_CODE_TTL: u32 = 3_600;
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
@@ -163,6 +208,23 @@ impl Config {
             return Err(format!(
                 "notify.duration_ms 必须在 {MIN_NOTIFY_MS} 到 {MAX_NOTIFY_MS} 之间"
             ));
+        }
+        if self.phone.port < MIN_PHONE_PORT {
+            return Err(format!(
+                "phone.port 必须是 {MIN_PHONE_PORT} 到 65535 之间的端口"
+            ));
+        }
+        if !(MIN_CODE_TTL..=MAX_CODE_TTL).contains(&self.phone.code_ttl_secs) {
+            return Err(format!(
+                "phone.code_ttl_secs 必须在 {MIN_CODE_TTL} 到 {MAX_CODE_TTL} 秒之间"
+            ));
+        }
+        if !self.phone.token.is_empty()
+            && (self.phone.token.len() < 16
+                || self.phone.token.len() > 64
+                || !self.phone.token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        {
+            return Err("phone.token 必须是 16 到 64 位的字母或数字".into());
         }
         if !(10..=32).contains(&self.appearance.font_size) {
             return Err("appearance.font_size 必须在 10 到 32 之间".into());
@@ -257,6 +319,10 @@ impl Config {
             ("ocr", "language", quote(&self.ocr.language)),
             ("notify", "enabled", self.notify.enabled.to_string()),
             ("notify", "duration_ms", self.notify.duration_ms.to_string()),
+            ("phone", "enabled", self.phone.enabled.to_string()),
+            ("phone", "port", self.phone.port.to_string()),
+            ("phone", "token", quote(&self.phone.token)),
+            ("phone", "code_ttl_secs", self.phone.code_ttl_secs.to_string()),
         ]
     }
 }
@@ -293,7 +359,7 @@ fn trailing_comment(value: &str) -> &str {
             index += 1;
         }
     }
-    let rest = &value[index.min(value.len())..];
+    let rest = value.get(index.min(value.len())..).unwrap_or_default();
     match rest.find(" #") {
         Some(position) => {
             let start = rest[..position].trim_end().len();
@@ -440,10 +506,60 @@ mod tests {
     #[test]
     fn missing_notify_section_falls_back_to_defaults() {
         // 旧版 config.yaml 没有 notify 段落，加载时应使用默认值。
+        let source = without_section(DEFAULT_CONFIG, "notify");
+        assert!(!source.contains("\nnotify:"));
+        let config: Config = serde_yaml::from_str(&source).unwrap();
+        assert!(config.notify.enabled);
+        assert_eq!(config.notify.duration_ms, 2_000);
+
+        let mut config = default_config();
+        config.notify.duration_ms = 599;
+        assert!(config.validate().is_err());
+        config.notify.duration_ms = 8_001;
+        assert!(config.validate().is_err());
+        config.notify.duration_ms = 600;
+        assert!(config.validate().is_ok());
+        config.notify.enabled = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_phone_section_falls_back_to_disabled_defaults() {
+        let source = without_section(DEFAULT_CONFIG, "phone");
+        assert!(!source.contains("\nphone:"));
+        let config: Config = serde_yaml::from_str(&source).unwrap();
+        assert!(!config.phone.enabled);
+        assert!(config.phone.token.is_empty());
+        assert_eq!(config.phone.port, 8788);
+        assert_eq!(config.phone.code_ttl_secs, 300);
+
+        let mut config = default_config();
+        config.phone.enabled = true;
+        assert!(config.validate().is_ok());
+
+        config.phone.port = 1_023;
+        assert!(config.validate().is_err());
+        config.phone.port = 8788;
+
+        config.phone.code_ttl_secs = 29;
+        assert!(config.validate().is_err());
+        config.phone.code_ttl_secs = 3_601;
+        assert!(config.validate().is_err());
+        config.phone.code_ttl_secs = 300;
+
+        config.phone.token = "short".into();
+        assert!(config.validate().is_err());
+        config.phone.token = "0123456789abcdef0123456789abcdef".into();
+        assert!(config.validate().is_ok());
+    }
+
+    /// 从默认模板里剥掉一整段，用来模拟旧版本的配置文件。
+    fn without_section(source: &str, section: &str) -> String {
+        let header = format!("{section}:");
         let mut kept: Vec<&str> = Vec::new();
         let mut skipping = false;
-        for line in DEFAULT_CONFIG.lines() {
-            if line.starts_with("notify:") {
+        for line in source.lines() {
+            if line.starts_with(&header) {
                 skipping = true;
                 continue;
             }
@@ -459,21 +575,7 @@ mod tests {
             }
             kept.push(line);
         }
-        let source = kept.join("\n");
-        assert!(!source.contains("notify:"));
-        let config: Config = serde_yaml::from_str(&source).unwrap();
-        assert!(config.notify.enabled);
-        assert_eq!(config.notify.duration_ms, 2_000);
-
-        let mut config = default_config();
-        config.notify.duration_ms = 599;
-        assert!(config.validate().is_err());
-        config.notify.duration_ms = 8_001;
-        assert!(config.validate().is_err());
-        config.notify.duration_ms = 600;
-        assert!(config.validate().is_ok());
-        config.notify.enabled = false;
-        assert!(config.validate().is_ok());
+        kept.join("\n")
     }
 
     #[test]

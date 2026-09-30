@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     platform,
+    relay::{self, RelayContext, RelaySms},
     store::{Entry, Snippet, Store, TagCount},
 };
 use std::{
@@ -9,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
         mpsc::{sync_channel, SyncSender},
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
     time::Duration,
 };
@@ -31,6 +32,8 @@ struct AppState {
     preview_terms: Mutex<Vec<String>>,
     toast_sequence: AtomicU32,
     toast_generation: AtomicU32,
+    phone_stop: Mutex<Option<Arc<AtomicBool>>>,
+    phone_state: Mutex<PhoneRuntime>,
 }
 
 /// 右下角“已复制”提示的内容：一段预览文字加上长度/尺寸说明。
@@ -138,6 +141,269 @@ fn notify_copied(app: &tauri::AppHandle, kind: &str, preview: String, detail: St
                 let _ = platform::hide_toast(&toast);
             }
         });
+}
+
+/// 验证码在历史里带的标签：既方便筛选，也让过期验证码能被批量清掉。
+const PHONE_CODE_TAG: &str = "验证码";
+
+/// 配对页上显示的名字。
+const PHONE_DEVICE_NAME: &str = "剪藏";
+
+/// 手机验证码服务的运行时状态：是否在监听、最近一次收到的验证码。
+#[derive(Default)]
+struct PhoneRuntime {
+    running: bool,
+    error: Option<String>,
+    last: Option<PhoneCode>,
+}
+
+/// 最近一次收到的验证码，用于设置面板回显与倒计时。
+#[derive(Clone, serde::Serialize)]
+struct PhoneCode {
+    code: String,
+    from: Option<String>,
+    received_at: u64,
+    expires_at: u64,
+}
+
+/// 设置面板需要的手机接入信息：局域网地址、配对二维码与当前状态。
+#[derive(Clone, serde::Serialize)]
+struct PhoneStatus {
+    enabled: bool,
+    running: bool,
+    address: String,
+    token: String,
+    pairing: String,
+    qr: String,
+    code_ttl_secs: u32,
+    last: Option<PhoneCode>,
+    error: Option<String>,
+}
+
+/// 局域网访问地址；拿不到本机地址时回落到 127.0.0.1（手机连不上，界面上会提醒）。
+fn phone_host() -> String {
+    relay::lan_ipv4()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into())
+}
+
+/// 配对令牌为空时现场生成并写回 config.yaml，让二维码扫码即用。
+fn ensure_phone_token(app: &tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let mut config = lock(&state.config)?;
+    if !config.phone.token.is_empty() {
+        return Ok(config.phone.token.clone());
+    }
+    config.phone.token = relay::random_token();
+    config.save(&state.config_path)?;
+    Ok(config.phone.token.clone())
+}
+
+fn phone_snapshot(app: &tauri::AppHandle) -> Result<PhoneStatus, String> {
+    let state = app.state::<AppState>();
+    let phone = lock(&state.config)?.phone.clone();
+    let host = phone_host();
+    let pairing = relay::pairing_payload(&host, phone.port, &phone.token, PHONE_DEVICE_NAME);
+    let qr = if phone.token.is_empty() {
+        String::new()
+    } else {
+        relay::qr_data_uri(&pairing).unwrap_or_default()
+    };
+    let runtime = lock(&state.phone_state)?;
+    Ok(PhoneStatus {
+        enabled: phone.enabled,
+        running: runtime.running,
+        address: format!("{host}:{}", phone.port),
+        token: phone.token,
+        pairing,
+        qr,
+        code_ttl_secs: phone.code_ttl_secs,
+        last: runtime.last.clone(),
+        error: runtime.error.clone(),
+    })
+}
+
+#[tauri::command]
+fn phone_status(app: tauri::AppHandle) -> Result<PhoneStatus, String> {
+    phone_snapshot(&app)
+}
+
+/// 重新生成配对令牌：已经配对过的手机需要重新扫码。
+#[tauri::command]
+fn phone_regenerate(app: tauri::AppHandle) -> Result<PhoneStatus, String> {
+    let state = app.state::<AppState>();
+    let config = {
+        let mut current = lock(&state.config)?;
+        current.phone.token = relay::random_token();
+        current.save(&state.config_path)?;
+        current.clone()
+    };
+    sync_phone(&app);
+    let _ = app.emit("settings-changed", &config);
+    let _ = app.emit("phone-changed", ());
+    phone_snapshot(&app)
+}
+
+/// 按当前配置起停手机验证码监听；配置变化时先停旧的，再按需起新的。
+fn sync_phone(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut slot) = state.phone_stop.lock() {
+        if let Some(stop) = slot.take() {
+            stop.store(true, Ordering::Release);
+        }
+    }
+    if let Ok(mut runtime) = state.phone_state.lock() {
+        runtime.running = false;
+    }
+    let phone = match lock(&state.config) {
+        Ok(config) => config.phone.clone(),
+        Err(error) => return report(app, error),
+    };
+    if !phone.enabled {
+        let _ = app.emit("phone-changed", ());
+        return;
+    }
+    let token = match ensure_phone_token(app) {
+        Ok(token) => token,
+        Err(error) => return report(app, error),
+    };
+    let port = phone.port;
+    let ttl = phone.code_ttl_secs;
+    let context = Arc::new(RelayContext {
+        token,
+        version: env!("CARGO_PKG_VERSION").into(),
+        host: phone_host(),
+        port,
+    });
+    let listener = match relay::bind(port) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = format!("手机验证码端口 {port} 监听失败：{error}");
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                runtime.error = Some(message.clone());
+            }
+            let _ = app.emit("phone-changed", ());
+            return report(app, message);
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(mut slot) = state.phone_stop.lock() {
+        *slot = Some(stop.clone());
+    }
+    if let Ok(mut runtime) = state.phone_state.lock() {
+        runtime.running = true;
+        runtime.error = None;
+    }
+    let server_app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("phone-relay".into())
+        .spawn(move || {
+            let handler_app = server_app.clone();
+            let result = relay::serve(listener, context, stop, move |sms| {
+                on_phone_code(&handler_app, sms, ttl);
+            });
+            if let Err(error) = result {
+                report(&server_app, format!("手机验证码监听已停止：{error}"));
+            }
+            let state = server_app.state::<AppState>();
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                runtime.running = false;
+            }
+            let _ = server_app.emit("phone-changed", ());
+        });
+    if let Err(error) = spawned {
+        report(app, error);
+    }
+    let _ = app.emit("phone-changed", ());
+}
+
+/// 收到验证码：写进系统剪贴板、存进历史，并安排到期自动删除。
+fn on_phone_code(app: &tauri::AppHandle, sms: RelaySms, ttl_secs: u32) {
+    let state = app.state::<AppState>();
+    let now = relay::now_seconds();
+    let stored = (|| -> Result<(i64, i64), String> {
+        let _gate = lock(&state.clipboard_gate)?;
+        let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+        clipboard
+            .set_text(sms.code.clone())
+            .map_err(|error| error.to_string())?;
+        // 告诉监听线程：这次剪贴板变化是自己写的，不要再当成一次新的复制。
+        state
+            .own_sequence
+            .store(platform::clipboard_sequence(), Ordering::Release);
+        drop(clipboard);
+        let mut store = lock(&state.store)?;
+        let id = store.insert_text(&sms.code)?;
+        store.set_entry_tags(id, &[PHONE_CODE_TAG.to_string()])?;
+        let stamp = store.get(id)?.created_at;
+        Ok((id, stamp))
+    })();
+    match stored {
+        Ok((id, stamp)) => {
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                runtime.last = Some(PhoneCode {
+                    code: sms.code.clone(),
+                    from: sms.from.clone(),
+                    received_at: now,
+                    expires_at: now.saturating_add(u64::from(ttl_secs)),
+                });
+                runtime.error = None;
+            }
+            let _ = app.emit("history-changed", ());
+            let _ = app.emit("phone-changed", ());
+            let from = sms.from.clone().unwrap_or_else(|| "短信".to_string());
+            notify_copied(
+                app,
+                "code",
+                sms.code.clone(),
+                format!("来自 {from} · 已复制，{ttl_secs} 秒后自动清除"),
+            );
+            expire_code(app, id, sms.code.clone(), stamp, ttl_secs);
+        }
+        Err(error) => {
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                runtime.error = Some(format!("验证码写入失败：{error}"));
+            }
+            let _ = app.emit("phone-changed", ());
+            report(app, format!("验证码写入失败：{error}"));
+        }
+    }
+}
+
+/// 验证码只是一次性凭据：到期后从历史里删掉，别让明文长期留在磁盘上。
+fn expire_code(app: &tauri::AppHandle, id: i64, code: String, stamp: i64, ttl_secs: u32) {
+    let worker = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("phone-expire".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(u64::from(ttl_secs)));
+            let state = worker.state::<AppState>();
+            // 同一条记录可能已经被重新复制过（created_at 会变），那就交给新的定时器管。
+            let unchanged = lock(&state.store)
+                .and_then(|store| store.get(id))
+                .is_ok_and(|entry| entry.text == code && entry.created_at == stamp);
+            if unchanged {
+                match lock(&state.store).and_then(|mut store| store.delete(id)) {
+                    Ok(()) => {
+                        let _ = worker.emit("history-changed", ());
+                    }
+                    Err(error) => report(&worker, format!("验证码自动清除失败：{error}")),
+                }
+            }
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                if runtime
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.code == code)
+                {
+                    runtime.last = None;
+                }
+            }
+            let _ = worker.emit("phone-changed", ());
+        });
+    if let Err(error) = spawned {
+        report(app, error);
+    }
 }
 
 fn report(app: &tauri::AppHandle, error: impl ToString) {
@@ -417,6 +683,7 @@ fn apply_config(app: &tauri::AppHandle, next: Config, persist: bool) -> Result<C
     }
     *current = next.clone();
     drop(current);
+    sync_phone(&app);
     app.emit("settings-changed", &next)
         .map_err(|e| e.to_string())?;
     app.emit("history-changed", ()).map_err(|e| e.to_string())?;
@@ -764,7 +1031,9 @@ pub fn run() {
             reload_config,
             save_settings,
             set_entry_tags,
-            list_tags
+            list_tags,
+            phone_status,
+            phone_regenerate
         ])
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
@@ -789,6 +1058,8 @@ pub fn run() {
                 preview_terms: Mutex::new(Vec::new()),
                 toast_sequence: AtomicU32::new(u32::MAX),
                 toast_generation: AtomicU32::new(0),
+                phone_stop: Mutex::new(None),
+                phone_state: Mutex::new(PhoneRuntime::default()),
             });
             let popup = window(app.handle())?;
             popup.set_size(tauri::LogicalSize::new(
@@ -833,6 +1104,13 @@ pub fn run() {
                 })
                 .build(app)?;
             start_workers(app.handle(), ocr_rx)?;
+            // 上次运行留下的验证码要补扫一次：进程重启会丢掉内存里的定时器。
+            let state = app.state::<AppState>();
+            let ttl = config.phone.code_ttl_secs;
+            if let Err(error) = lock(&state.store).and_then(|mut store| store.sweep_codes(PHONE_CODE_TAG, ttl)) {
+                report(app.handle(), error);
+            }
+            sync_phone(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match event {

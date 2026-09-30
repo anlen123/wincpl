@@ -700,6 +700,36 @@ impl Store {
         Ok(counts)
     }
 
+    /// 删掉带着 `tag` 标记、且写入时间早于 `ttl_secs` 的一次性验证码。
+    /// 进程重启会丢掉内存里的定时器，所以启动时补扫一遍。
+    pub fn sweep_codes(&mut self, tag: &str, ttl_secs: u32) -> Result<usize, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let deadline = now.saturating_sub(i64::from(ttl_secs) * 1_000);
+        let ids: Vec<i64> = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT id FROM entries\n                     WHERE tags LIKE ?1 ESCAPE '\\' COLLATE NOCASE AND created_at <= ?2",
+                )
+                .map_err(|error| format!("无法清理过期验证码：{error}"))?;
+            let rows = statement
+                .query_map(params![tag_like_pattern(tag), deadline], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| format!("无法清理过期验证码：{error}"))?;
+            rows.collect::<Result<Vec<i64>, _>>()
+                .map_err(|error| format!("无法清理过期验证码：{error}"))?
+        };
+        for id in &ids {
+            self.delete(*id)?;
+        }
+        Ok(ids.len())
+    }
+
     pub fn set_max_items(&mut self, max_items: usize) -> Result<(), String> {
         validate_max_items(max_items)?;
         self.max_items = max_items;
@@ -1282,6 +1312,38 @@ mod tests {
         assert_eq!(store.list_snippets("", Some("邮件"), 20).unwrap().len(), 1);
         assert_eq!(store.get_snippet(snippet).unwrap().tags, ["邮件"]);
         assert_eq!(store.list_tags(true).unwrap()[0].name, "邮件");
+    }
+
+    #[test]
+    fn sweep_codes_removes_only_expired_tagged_entries() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut store = Store::open(directory.path(), 50).expect("open store");
+        let stale = store.insert_text("654321").expect("insert stale code");
+        store
+            .set_entry_tags(stale, &["验证码".to_string()])
+            .expect("tag stale code");
+        let fresh = store.insert_text("123456").expect("insert fresh code");
+        store
+            .set_entry_tags(fresh, &["验证码".to_string()])
+            .expect("tag fresh code");
+        let plain = store.insert_text("普通文本").expect("insert plain text");
+        let hour_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - 3_600_000;
+        store
+            .conn
+            .execute(
+                "UPDATE entries SET created_at = ?1 WHERE id = ?2",
+                params![hour_ago, stale],
+            )
+            .expect("backdate stale code");
+
+        assert_eq!(store.sweep_codes("验证码", 300).expect("sweep"), 1);
+        assert!(store.get(stale).is_err());
+        assert!(store.get(fresh).is_ok());
+        assert!(store.get(plain).is_ok());
     }
 
     #[test]

@@ -23,6 +23,7 @@ type Config = {
   history: { display_limit: number; max_items: number; max_image_mb: number; max_text_kb: number };
   ocr: { language: string };
   notify: { enabled: boolean; duration_ms: number };
+  phone: { enabled: boolean; port: number; token: string; code_ttl_secs: number };
 };
 
 type Entry = {
@@ -104,6 +105,16 @@ const tagInput = requireElement<HTMLInputElement>("tag-input");
 const tagSuggestions = requireElement<HTMLElement>("tag-suggestions");
 const tagError = requireElement<HTMLElement>("tag-error");
 const tagSave = requireElement<HTMLButtonElement>("tag-save");
+const phoneSection = requireElement<HTMLElement>("phone-pairing");
+const phoneDot = requireElement<HTMLElement>("phone-dot");
+const phoneStateText = requireElement<HTMLElement>("phone-state-text");
+const phoneQr = requireElement<HTMLImageElement>("phone-qr");
+const phoneQrFallback = requireElement<HTMLElement>("phone-qr-fallback");
+const phoneAddress = requireElement<HTMLElement>("phone-address");
+const phoneTokenValue = requireElement<HTMLElement>("phone-token");
+const phoneLast = requireElement<HTMLElement>("phone-last");
+const phonePairingText = requireElement<HTMLElement>("phone-pairing-text");
+const phoneRegenerate = requireElement<HTMLButtonElement>("phone-regenerate");
 
 const hasNativeBackend = "__TAURI_INTERNALS__" in window;
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
@@ -617,6 +628,15 @@ const SETTINGS_GROUPS: FieldGroup[] = [
       { section: "notify", key: "duration_ms", label: "停留时长", kind: "number", min: 600, max: 8000, hint: "600–8000 毫秒" },
     ],
   },
+  {
+    title: "手机验证码",
+    description: "手机 App 收到验证码短信后自动发到这台电脑：直接写进系统剪贴板、弹一个果冻提示，并在设定时间后从历史里自动清除。",
+    fields: [
+      { section: "phone", key: "enabled", label: "启用手机接入", kind: "switch", hint: "局域网监听" },
+      { section: "phone", key: "port", label: "监听端口", kind: "number", min: 1024, max: 65535, hint: "1024–65535" },
+      { section: "phone", key: "code_ttl_secs", label: "验证码保留", kind: "number", min: 30, max: 3600, hint: "30–3600 秒" },
+    ],
+  },
 ];
 
 type Preset = { name: string; colors: Partial<Appearance> };
@@ -894,11 +914,110 @@ async function saveSettings(): Promise<void> {
     applySettings(saved);
     fillSettingsForm(saved);
     setSettingsStatus("已保存，并写回配置文件", "ok");
+    void refreshPhoneStatus();
   } catch (error) {
     setSettingsStatus(errorText(error), "error");
   } finally {
     savingSettings = false;
     updateSettingsDirty();
+  }
+}
+
+// ---------- 手机验证码配对 ----------
+
+type PhoneCode = { code: string; from: string | null; received_at: number; expires_at: number };
+type PhoneStatus = {
+  enabled: boolean;
+  running: boolean;
+  address: string;
+  token: string;
+  pairing: string;
+  qr: string;
+  code_ttl_secs: number;
+  last: PhoneCode | null;
+  error: string | null;
+};
+
+let phoneStatus: PhoneStatus | null = null;
+let phoneTicker: number | undefined;
+
+function countdownText(expiresAt: number): string {
+  const left = expiresAt - Math.floor(Date.now() / 1000);
+  return left > 0 ? `${left} 秒后自动清除` : "已清除";
+}
+
+function renderPhoneLast(): void {
+  const last = phoneStatus?.last ?? null;
+  phoneLast.textContent = last
+    ? `${last.code} · 来自 ${last.from ?? "短信"} · ${countdownText(last.expires_at)}`
+    : "还没有收到验证码";
+}
+
+function phoneStateTextOf(status: PhoneStatus | null): string {
+  if (!status || !status.enabled) return "未开启 · 打开上面的开关后开始监听";
+  if (status.running) return "正在监听 · 等手机发来验证码";
+  return status.error ?? "监听未启动";
+}
+
+function phoneTone(status: PhoneStatus | null): string {
+  if (!status?.enabled) return "off";
+  return status.running ? "on" : "error";
+}
+
+function renderPhoneStatus(): void {
+  const enabled = phoneStatus?.enabled ?? false;
+  phoneDot.dataset.tone = phoneTone(phoneStatus);
+  phoneStateText.textContent = phoneStateTextOf(phoneStatus);
+  phoneAddress.textContent = phoneStatus?.address ?? "—";
+  const token = phoneStatus?.token ?? "";
+  phoneTokenValue.textContent = token ? `${token.slice(0, 8)}…${token.slice(-4)}` : "—";
+  phonePairingText.textContent = phoneStatus?.pairing || "—";
+  const qr = phoneStatus?.qr ?? "";
+  phoneQr.hidden = !qr;
+  if (qr) phoneQr.src = qr;
+  phoneQrFallback.hidden = Boolean(qr);
+  phoneQrFallback.textContent = enabled ? "二维码生成失败，请用下方链接手动配对" : "打开「启用手机接入」后生成二维码";
+  phoneRegenerate.disabled = !hasNativeBackend || !token;
+  renderPhoneLast();
+}
+
+async function refreshPhoneStatus(): Promise<void> {
+  if (!hasNativeBackend) {
+    renderPhoneStatus();
+    return;
+  }
+  try {
+    phoneStatus = await invoke<PhoneStatus>("phone_status");
+  } catch (error) {
+    showError(error);
+  }
+  renderPhoneStatus();
+}
+
+/** 最近验证码的剩余时间每秒变一次，面板关掉就停掉定时器。 */
+function startPhoneTicker(): void {
+  window.clearInterval(phoneTicker);
+  phoneTicker = window.setInterval(() => {
+    if (!panelOpen) {
+      window.clearInterval(phoneTicker);
+      phoneTicker = undefined;
+      return;
+    }
+    renderPhoneLast();
+  }, 1000);
+}
+
+async function regeneratePhoneToken(): Promise<void> {
+  if (!hasNativeBackend || phoneRegenerate.disabled) return;
+  if (!window.confirm("重新生成令牌会让已配对的手机失效，需要重新扫码。继续？")) return;
+  phoneRegenerate.disabled = true;
+  try {
+    phoneStatus = await invoke<PhoneStatus>("phone_regenerate");
+    setSettingsStatus("已生成新的配对令牌，请用手机重新扫码", "ok");
+  } catch (error) {
+    showError(error);
+  } finally {
+    renderPhoneStatus();
   }
 }
 
@@ -910,6 +1029,8 @@ function openSettings(): void {
   settingsPanel.hidden = false;
   settingsScrim.hidden = false;
   settingsToggle.setAttribute("aria-expanded", "true");
+  void refreshPhoneStatus();
+  startPhoneTicker();
   requestAnimationFrame(() => {
     root.classList.add("settings-open");
     settingsClose.focus();
@@ -920,6 +1041,8 @@ function closeSettings(restoreFocus = true, force = false): void {
   if (!panelOpen) return;
   if (!force && isSettingsDirty() && !window.confirm("放弃未保存的设置修改？")) return;
   panelOpen = false;
+  window.clearInterval(phoneTicker);
+  phoneTicker = undefined;
   if (currentConfig) {
     applyAppearance(currentConfig.appearance);
     fillSettingsForm(currentConfig);
@@ -1002,6 +1125,7 @@ function resetForPopup(nextMode: Mode = "clipboard"): void {
   searchInput.setAttribute("aria-label", searchInput.placeholder);
   requireElement("history-settings").hidden = mode === "snippets";
   requireElement("ocr-settings").hidden = mode === "snippets";
+  phoneSection.hidden = mode === "snippets";
   historyRefreshPending = false;
   window.clearTimeout(searchTimer);
   searchInput.value = "";
@@ -1187,7 +1311,8 @@ async function initializeNative(): Promise<void> {
       listen<string>("popup-shown", (event) => resetForPopup(event.payload === "snippets" ? "snippets" : "clipboard")),
       listen("history-changed", () => { if (mode === "clipboard") refreshForHistoryChange(); }),
       listen("snippets-changed", () => { if (mode === "snippets") refreshForHistoryChange(); }),
-      listen<string>("app-error", (event) => showError(event.payload)),
+      listen("app-error", (event) => showError(event.payload)),
+      listen("phone-changed", () => void refreshPhoneStatus()),
       listen<Config>("settings-changed", (event) => {
         const dirty = panelOpen && isSettingsDirty();
         applySettings(event.payload);
@@ -1214,6 +1339,7 @@ function initializeBrowserPreview(): void {
   clearHistoryButton.disabled = true;
   settingsSave.disabled = true;
   settingsRevert.disabled = true;
+  phoneRegenerate.disabled = true;
   setSettingsStatus("设置需要在桌面应用中修改");
 }
 
@@ -1262,6 +1388,7 @@ tagInput.addEventListener("input", renderTagSuggestions);
 tagSave.addEventListener("click", () => void saveTags());
 requireElement("tag-cancel").addEventListener("click", () => closeTagEditor());
 tagEditor.addEventListener("cancel", (event) => { event.preventDefault(); closeTagEditor(); });
+phoneRegenerate.addEventListener("click", () => void regeneratePhoneToken());
 
 // ---------- 代码片段编辑 ----------
 

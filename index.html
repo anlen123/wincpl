@@ -109,6 +109,33 @@
           </div>
         </form>
 
+        <section id="phone-pairing" class="settings-group" aria-labelledby="phone-heading">
+          <h3 id="phone-heading">手机配对</h3>
+          <p>用「剪藏」手机 App 扫下面的二维码即可接入。手机和电脑要在同一个 Wi-Fi，首次开启时 Windows 防火墙弹窗请选择「允许访问」。</p>
+          <p class="phone-state-row">
+            <span id="phone-dot" class="phone-dot" data-tone="off" aria-hidden="true"></span>
+            <span id="phone-state-text" aria-live="polite">未开启</span>
+          </p>
+          <div class="phone-pairing-body">
+            <div class="phone-qr">
+              <img id="phone-qr" alt="配对二维码" hidden />
+              <p id="phone-qr-fallback" class="phone-qr-fallback">打开「启用手机接入」后生成二维码</p>
+            </div>
+            <dl class="phone-meta">
+              <div><dt>局域网地址</dt><dd><code id="phone-address">—</code></dd></div>
+              <div><dt>配对令牌</dt><dd><code id="phone-token">—</code></dd></div>
+              <div><dt>最近验证码</dt><dd id="phone-last">还没有收到验证码</dd></div>
+            </dl>
+          </div>
+          <div class="button-row">
+            <button id="phone-regenerate" class="secondary-button" type="button" disabled>重新生成令牌</button>
+          </div>
+          <details class="phone-manual">
+            <summary>手动配对（把这段链接填进手机 App）</summary>
+            <code id="phone-pairing-text">—</code>
+          </details>
+        </section>
+
         <section class="settings-group" aria-labelledby="config-heading">
           <h3 id="config-heading">YAML 配置文件</h3>
           <p>也可以直接编辑配置文件，保存后点「重新载入」。设置面板保存时会保留文件中的注释。</p>

@@ -111,11 +111,18 @@ function clampDuration(value: number): number {
   return Math.min(MAX_DURATION_MS, Math.max(MIN_DURATION_MS, Math.round(value)));
 }
 
+const TOAST_KINDS: Record<string, { badge: string; title: string }> = {
+  image: { badge: "图", title: "已复制图片" },
+  code: { badge: "码", title: "收到短信验证码" },
+};
+const TOAST_FALLBACK = { badge: "文", title: "已复制到剪贴板" };
+
 function render(payload: ToastPayload): void {
   const image = payload.kind === "image";
+  const kind = TOAST_KINDS[payload.kind] ?? TOAST_FALLBACK;
   card.dataset.kind = payload.kind;
-  badge.textContent = image ? "图" : "文";
-  titleText.textContent = image ? "已复制图片" : "已复制到剪贴板";
+  badge.textContent = kind.badge;
+  titleText.textContent = kind.title;
   previewText.textContent = image ? "已存入历史，之后能用图里的文字搜索" : payload.preview;
   metaText.textContent = payload.detail;
 

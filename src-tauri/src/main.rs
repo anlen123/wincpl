@@ -8,6 +8,7 @@ mod layout;
 mod ocr;
 #[cfg(windows)]
 mod platform;
+mod relay;
 mod store;
 
 #[cfg(windows)]
@@ -17,6 +18,6 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("剪藏仅支持 Windows 11。当前平台可运行存储测试和浏览器界面预览。");
+    eprintln!("剪藏仅支持 Windows 11。当前平台可运行存储与手机接入测试，以及浏览器界面预览。");
     std::process::exit(1);
 }

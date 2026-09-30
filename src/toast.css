@@ -102,6 +102,26 @@
 }
 
 /* 果冻感主要来自图标被“压扁再回弹” */
+.toast-card[data-kind="code"] .toast-badge {
+  background: var(--accent-soft, rgba(0, 0, 0, 0.08));
+  font-size: 12px;
+}
+
+/* 验证码本身就是重点：放大、拉开字距，一眼能看清 */
+.toast-card[data-kind="code"] .toast-preview {
+  color: var(--text-color);
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: 0.14em;
+}
+
+.toast-card[data-kind="code"] .toast-meta {
+  max-width: 60%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .toast-card.is-in .toast-badge {
   animation: toast-badge-jelly 700ms cubic-bezier(0.22, 1.16, 0.36, 1) both;
 }

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">剪藏验证码</string>
+    <string name="eyebrow">剪藏 · 手机验证码</string>
+    <string name="title">短信验证码直送电脑</string>
+    <string name="subtitle">扫一下电脑剪藏设置里的二维码完成配对，手机收到的验证码会自动复制到电脑剪贴板，不用再低头看手机。</string>
+
+    <string name="status_unpaired">还没配对</string>
+    <string name="status_unpaired_hint">在电脑上打开剪藏 → 设置 → 手机配对，用下面的按钮扫描那里的二维码。</string>
+    <string name="status_paired">已配对：%1$s</string>
+    <string name="status_paired_detail">电脑地址 %1$s · 令牌 %2$s</string>
+
+    <string name="scan">扫描二维码</string>
+    <string name="manual">手动配对</string>
+    <string name="test">测试连接</string>
+
+    <string name="enable">启用短信转发</string>
+    <string name="enable_hint">只转发含「验证码」等字样的短信，验证码在电脑上只会短暂保留，到期自动清除。需要「读取短信」权限，手机不会把短信发给除你电脑以外的任何地方。</string>
+
+    <string name="log_title">最近记录</string>
+    <string name="log_empty">暂无记录</string>
+
+    <string name="manual_title">粘贴配对链接</string>
+    <string name="manual_hint">jianzang://pair?host=…&amp;port=…&amp;token=…</string>
+    <string name="manual_paste">粘贴剪贴板</string>
+    <string name="ok">确定</string>
+    <string name="cancel">取消</string>
+
+    <string name="toast_bad_qr">这不是剪藏的配对二维码</string>
+    <string name="toast_paired">已配对 %1$s</string>
+    <string name="toast_no_permission">没有「读取短信」权限，无法转发验证码</string>
+    <string name="toast_no_pairing">先扫码配对，再打开开关</string>
+    <string name="toast_testing">正在连接电脑…</string>
+
+    <string name="notify_channel">验证码转发</string>
+    <string name="notify_channel_desc">手机上验证码转发到电脑的结果</string>
+    <string name="notify_ok_title">验证码已送到电脑</string>
+    <string name="notify_ok_body">已复制到电脑剪贴板：%1$s</string>
+    <string name="notify_fail_title">验证码转发失败</string>
+</resources>
