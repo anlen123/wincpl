@@ -29,6 +29,17 @@ struct AppState {
     snippet_mode: AtomicBool,
     preview: Mutex<Option<Entry>>,
     preview_terms: Mutex<Vec<String>>,
+    toast_sequence: AtomicU32,
+    toast_generation: AtomicU32,
+}
+
+/// 右下角“已复制”提示的内容：一段预览文字加上长度/尺寸说明。
+#[derive(Clone, serde::Serialize)]
+struct ToastPayload {
+    kind: String,
+    preview: String,
+    detail: String,
+    duration_ms: u32,
 }
 
 /// 预览窗口返回的数据：条目本身，加上当前搜索关键词，用于在浮窗内高亮。
@@ -60,6 +71,73 @@ fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
     value
         .lock()
         .map_err(|_| "内部状态锁已损坏，请重新启动剪藏".into())
+}
+
+/// 把一段剪贴板文字压成单行预览，空白折叠并截断到指定字符数。
+fn collapsed_preview(text: &str, limit: usize) -> String {
+    let mut preview = String::new();
+    for (index, word) in text.split_whitespace().enumerate() {
+        if index > 0 {
+            preview.push(' ');
+        }
+        preview.push_str(word);
+        if preview.chars().count() > limit {
+            break;
+        }
+    }
+    if preview.chars().count() > limit {
+        let mut trimmed: String = preview.chars().take(limit.saturating_sub(1)).collect();
+        trimmed.push('…');
+        return trimmed;
+    }
+    preview
+}
+
+/// 剪贴板真的变了以后，在右下角弹一个不抢焦点的果冻提示。
+/// 同一个剪贴板序号只提示一次，避免某些程序一次复制多发几次更新。
+fn notify_copied(app: &tauri::AppHandle, kind: &str, preview: String, detail: String) {
+    let state = app.state::<AppState>();
+    let notify = match lock(&state.config) {
+        Ok(config) => config.notify.clone(),
+        Err(_) => return,
+    };
+    if !notify.enabled {
+        return;
+    }
+    let sequence = platform::clipboard_sequence();
+    if state.toast_sequence.swap(sequence, Ordering::AcqRel) == sequence {
+        return;
+    }
+    let payload = ToastPayload {
+        kind: kind.into(),
+        preview,
+        detail,
+        duration_ms: notify.duration_ms,
+    };
+    let Some(toast) = app.get_webview_window("toast") else {
+        return;
+    };
+    // 先显示窗口再发事件：卡片默认 opacity: 0，所以不会闪旧内容，
+    // 而事件到达时窗口已经在屏幕上，果冻动画可以从第一帧开始播。
+    if let Err(error) = platform::show_toast(&toast) {
+        report(app, error);
+    }
+    let _ = toast.emit("toast-changed", &payload);
+    let generation = state.toast_generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    let app = app.clone();
+    let duration = Duration::from_millis(u64::from(notify.duration_ms));
+    let _ = std::thread::Builder::new()
+        .name("toast-hide".into())
+        .spawn(move || {
+            std::thread::sleep(duration);
+            let state = app.state::<AppState>();
+            if state.toast_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            if let Some(toast) = app.get_webview_window("toast") {
+                let _ = platform::hide_toast(&toast);
+            }
+        });
 }
 
 fn report(app: &tauri::AppHandle, error: impl ToString) {
@@ -489,8 +567,10 @@ async fn paste_item(app: tauri::AppHandle, id: i64, snippet: bool) -> Result<(),
     .map_err(|e| e.to_string())?
 }
 
-fn capture(app: &tauri::AppHandle) -> Result<(), String> {
+fn capture(app: &tauri::AppHandle, notify: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
+    // 自己粘贴引起的变化不提示，否则粘贴完立刻又弹出“已复制”。
+    let notify = notify && !state.pasting.load(Ordering::Acquire);
     let _gate = lock(&state.clipboard_gate)?;
     let sequence = platform::clipboard_sequence();
     if sequence == state.own_sequence.load(Ordering::Acquire) {
@@ -514,6 +594,14 @@ fn capture(app: &tauri::AppHandle) -> Result<(), String> {
         }
         lock(&state.store)?.insert_image(&image.bytes, image.width as u32, image.height as u32)?;
         let _ = state.ocr_wake.try_send(());
+        if notify {
+            notify_copied(
+                app,
+                "image",
+                String::new(),
+                format!("{} × {} 像素", image.width, image.height),
+            );
+        }
     } else {
         match clipboard.get_text() {
             Ok(text) if !text.is_empty() => {
@@ -524,6 +612,10 @@ fn capture(app: &tauri::AppHandle) -> Result<(), String> {
                     return Ok(());
                 }
                 lock(&state.store)?.insert_text(&text)?;
+                if notify {
+                    let detail = format!("{} 个字符", text.chars().count());
+                    notify_copied(app, "text", collapsed_preview(&text, 96), detail);
+                }
             }
             Ok(_) | Err(arboard::Error::ContentNotAvailable) => return Ok(()),
             Err(error) => return Err(error.to_string()),
@@ -545,7 +637,8 @@ fn start_workers(
         .name("clipboard-capture".into())
         .spawn(move || {
             // Capture the current clipboard once, then sleep until WM_CLIPBOARDUPDATE.
-            if let Err(error) = capture(&capture_app) {
+            // 启动时的初剪贴板属于“旧内容”，不弹出提示。
+            if let Err(error) = capture(&capture_app, false) {
                 report(&capture_app, error);
             }
             while capture_rx.recv().is_ok() {
@@ -554,7 +647,7 @@ fn start_workers(
                     if delay > 0 {
                         std::thread::sleep(Duration::from_millis(delay));
                     }
-                    match capture(&capture_app) {
+                    match capture(&capture_app, true) {
                         Ok(()) => {
                             last = None;
                             break;
@@ -694,6 +787,8 @@ pub fn run() {
                 snippet_mode: AtomicBool::new(false),
                 preview: Mutex::new(None),
                 preview_terms: Mutex::new(Vec::new()),
+                toast_sequence: AtomicU32::new(u32::MAX),
+                toast_generation: AtomicU32::new(0),
             });
             let popup = window(app.handle())?;
             popup.set_size(tauri::LogicalSize::new(

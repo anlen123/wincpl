@@ -9,7 +9,9 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   build: {
-    rollupOptions: { input: { main: "index.html", preview: "preview.html" } },
+    rollupOptions: {
+      input: { main: "index.html", preview: "preview.html", toast: "toast.html" },
+    },
     target: "es2021",
     minify: "esbuild",
     sourcemap: !!process.env.TAURI_ENV_DEBUG,

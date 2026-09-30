@@ -22,6 +22,7 @@ type Config = {
   appearance: Appearance;
   history: { display_limit: number; max_items: number; max_image_mb: number; max_text_kb: number };
   ocr: { language: string };
+  notify: { enabled: boolean; duration_ms: number };
 };
 
 type Entry = {
@@ -555,7 +556,7 @@ async function hidePopup(): Promise<void> {
 
 // ---------- 设置表单 ----------
 
-type FieldKind = "text" | "number" | "color" | "hotkey";
+type FieldKind = "text" | "number" | "color" | "hotkey" | "switch";
 type FieldDef = {
   section: keyof Config;
   key: string;
@@ -608,6 +609,14 @@ const SETTINGS_GROUPS: FieldGroup[] = [
       { section: "ocr", key: "language", label: "OCR 语言", kind: "text", hint: "如 zh-Hans、en-US" },
     ],
   },
+  {
+    title: "复制提示",
+    description: "剪贴板内容变化时，在屏幕右下角弹出一个不抢焦点的果冻提示；面板或预览浮窗占着右下角时会自动闪到左下角。",
+    fields: [
+      { section: "notify", key: "enabled", label: "弹出提示", kind: "switch", hint: "复制后提醒一下" },
+      { section: "notify", key: "duration_ms", label: "停留时长", kind: "number", min: 600, max: 8000, hint: "600–8000 毫秒" },
+    ],
+  },
 ];
 
 type Preset = { name: string; colors: Partial<Appearance> };
@@ -648,7 +657,8 @@ const PRESETS: Preset[] = [
 
 const fieldInputs = new Map<string, { def: FieldDef; input: HTMLInputElement; swatch?: HTMLElement; picker?: HTMLInputElement }>();
 const fieldId = (def: FieldDef): string => `${def.section}.${def.key}`;
-type ConfigRecord = Record<string, Record<string, string | number>>;
+type ConfigValue = string | number | boolean;
+type ConfigRecord = Record<string, Record<string, ConfigValue>>;
 
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
 
@@ -736,7 +746,16 @@ function buildSettingsForm(): void {
       input.autocomplete = "off";
       input.spellcheck = false;
       const entry: { def: FieldDef; input: HTMLInputElement; swatch?: HTMLElement; picker?: HTMLInputElement } = { def, input };
-      if (def.kind === "number") {
+      if (def.kind === "switch") {
+        input.type = "checkbox";
+        const track = document.createElement("span");
+        track.className = "switch-track";
+        track.setAttribute("aria-hidden", "true");
+        const thumb = document.createElement("span");
+        thumb.className = "switch-thumb";
+        track.append(thumb);
+        control.append(track);
+      } else if (def.kind === "number") {
         input.type = "number";
         input.inputMode = "numeric";
         input.step = "1";
@@ -779,6 +798,7 @@ function buildSettingsForm(): void {
         updateSwatch(entry);
         onSettingsInput(def.section === "appearance");
       });
+      if (def.kind === "switch") input.addEventListener("change", () => onSettingsInput(false));
       control.append(input);
       label.append(caption, control);
       grid.append(label);
@@ -790,10 +810,12 @@ function buildSettingsForm(): void {
 }
 
 function fillSettingsForm(config: Config): void {
+  // SAFETY: Config 的每个分组都是纯量的扁平对象，运行时形状与 ConfigRecord 一致。
   const record = config as unknown as ConfigRecord;
   for (const entry of fieldInputs.values()) {
     const value = record[entry.def.section]?.[entry.def.key];
-    entry.input.value = value === undefined ? "" : String(value);
+    if (entry.def.kind === "switch") entry.input.checked = value === true || value === "true";
+    else entry.input.value = value === undefined ? "" : String(value);
     entry.input.removeAttribute("aria-invalid");
     updateSwatch(entry);
   }
@@ -803,13 +825,16 @@ function fillSettingsForm(config: Config): void {
 
 function readSettingsForm(): { config: Config | null; invalid: HTMLInputElement[] } {
   if (!currentConfig) return { config: null, invalid: [] };
+  // SAFETY: 同上，结构化克隆不会改变字段形状。
   const draft = structuredClone(currentConfig) as unknown as ConfigRecord;
   const invalid: HTMLInputElement[] = [];
   for (const { def, input } of fieldInputs.values()) {
     const raw = input.value.trim();
     let ok = raw.length > 0;
-    let value: string | number = raw;
-    if (def.kind === "number") {
+    let value: ConfigValue = raw;
+    if (def.kind === "switch") {
+      value = input.checked;
+    } else if (def.kind === "number") {
       const number = Number(raw);
       ok = ok && Number.isInteger(number) && (def.min === undefined || number >= def.min) && (def.max === undefined || number <= def.max);
       value = number;
@@ -821,6 +846,7 @@ function readSettingsForm(): { config: Config | null; invalid: HTMLInputElement[
     const section = draft[def.section];
     if (section && ok) section[def.key] = value;
   }
+  // SAFETY: draft 由 currentConfig 克隆而来，只有已通过校验的字段被覆写。
   return { config: draft as unknown as Config, invalid };
 }
 

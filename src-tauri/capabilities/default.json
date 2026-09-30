@@ -1,6 +1,6 @@
 {
   "identifier": "main-events",
-  "description": "Local picker and preview may subscribe to application events",
-  "windows": ["main", "preview"],
+  "description": "Local picker, preview and copy toast may subscribe to application events",
+  "windows": ["main", "preview", "toast"],
   "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
 }

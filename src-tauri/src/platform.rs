@@ -366,6 +366,86 @@ pub fn hide_preview(preview: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// 把“已复制”提示贴到当前显示器工作区右下角，并顶在最前面；
+/// 提示窗从不抢焦点，也不出现在任务栏。若右下角被面板或预览浮窗占用，则改放左下角。
+pub fn show_toast(toast: &tauri::WebviewWindow) -> Result<(), String> {
+    use tauri::Manager;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SW_SHOWNOACTIVATE,
+    };
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_err() {
+        point = POINT { x: 0, y: 0 };
+    }
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return Err("无法确定提示所在显示器".into());
+    }
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err("无法读取提示显示器工作区".into());
+    }
+    let scale = toast.scale_factor().map_err(|e| e.to_string())?;
+    let mut obstacles = Vec::new();
+    for label in ["main", "preview"] {
+        let Some(other) = toast.app_handle().get_webview_window(label) else {
+            continue;
+        };
+        if !other.is_visible().unwrap_or(false) {
+            continue;
+        }
+        if let (Ok(position), Ok(size)) = (other.outer_position(), other.outer_size()) {
+            obstacles.push(crate::layout::Rect::new(
+                position.x,
+                position.y,
+                size.width as i32,
+                size.height as i32,
+            ));
+        }
+    }
+    let gap = (16.0 * scale).round() as i32;
+    let work = info.rcWork;
+    let rect = crate::layout::toast_rect(
+        crate::layout::Rect {
+            left: work.left,
+            top: work.top,
+            right: work.right,
+            bottom: work.bottom,
+        },
+        &obstacles,
+        (360.0 * scale).round() as i32,
+        (110.0 * scale).round() as i32,
+        gap,
+    );
+    let hwnd = toast.hwnd().map_err(|e| e.to_string())?;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            SWP_NOACTIVATE,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    Ok(())
+}
+
+pub fn hide_toast(toast: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let hwnd = toast.hwnd().map_err(|e| e.to_string())?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ParsedChord {
     modifiers: [VIRTUAL_KEY; 4],

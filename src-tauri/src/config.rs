@@ -18,6 +18,8 @@ pub struct Config {
     pub appearance: Appearance,
     pub history: History,
     pub ocr: Ocr,
+    #[serde(default)]
+    pub notify: Notify,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -69,6 +71,36 @@ fn default_display_limit() -> usize {
 pub struct Ocr {
     pub language: String,
 }
+
+/// 复制到剪贴板后的右下角提示。旧配置缺少该段落时使用默认值。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    #[serde(default = "default_notify_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_notify_duration")]
+    pub duration_ms: u32,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            enabled: default_notify_enabled(),
+            duration_ms: default_notify_duration(),
+        }
+    }
+}
+
+fn default_notify_enabled() -> bool {
+    true
+}
+
+fn default_notify_duration() -> u32 {
+    2000
+}
+
+const MIN_NOTIFY_MS: u32 = 600;
+const MAX_NOTIFY_MS: u32 = 8_000;
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -125,6 +157,11 @@ impl Config {
         if !(1..=MAX_TEXT_KB).contains(&self.history.max_text_kb) {
             return Err(format!(
                 "history.max_text_kb 必须在 1 到 {MAX_TEXT_KB} 之间"
+            ));
+        }
+        if !(MIN_NOTIFY_MS..=MAX_NOTIFY_MS).contains(&self.notify.duration_ms) {
+            return Err(format!(
+                "notify.duration_ms 必须在 {MIN_NOTIFY_MS} 到 {MAX_NOTIFY_MS} 之间"
             ));
         }
         if !(10..=32).contains(&self.appearance.font_size) {
@@ -218,6 +255,8 @@ impl Config {
             ("history", "max_image_mb", self.history.max_image_mb.to_string()),
             ("history", "max_text_kb", self.history.max_text_kb.to_string()),
             ("ocr", "language", quote(&self.ocr.language)),
+            ("notify", "enabled", self.notify.enabled.to_string()),
+            ("notify", "duration_ms", self.notify.duration_ms.to_string()),
         ]
     }
 }
@@ -396,6 +435,45 @@ mod tests {
 
         config.history.max_items = 0;
         assert!(config.save(&path).is_err());
+    }
+
+    #[test]
+    fn missing_notify_section_falls_back_to_defaults() {
+        // 旧版 config.yaml 没有 notify 段落，加载时应使用默认值。
+        let mut kept: Vec<&str> = Vec::new();
+        let mut skipping = false;
+        for line in DEFAULT_CONFIG.lines() {
+            if line.starts_with("notify:") {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                let top_level = !line.is_empty()
+                    && !line.starts_with(' ')
+                    && !line.starts_with('\t')
+                    && !line.starts_with('#');
+                if !top_level {
+                    continue;
+                }
+                skipping = false;
+            }
+            kept.push(line);
+        }
+        let source = kept.join("\n");
+        assert!(!source.contains("notify:"));
+        let config: Config = serde_yaml::from_str(&source).unwrap();
+        assert!(config.notify.enabled);
+        assert_eq!(config.notify.duration_ms, 2_000);
+
+        let mut config = default_config();
+        config.notify.duration_ms = 599;
+        assert!(config.validate().is_err());
+        config.notify.duration_ms = 8_001;
+        assert!(config.validate().is_err());
+        config.notify.duration_ms = 600;
+        assert!(config.validate().is_ok());
+        config.notify.enabled = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

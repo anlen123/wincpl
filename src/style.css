@@ -271,6 +271,25 @@ kbd {
 }
 .swatch input[type="color"] { position: absolute; inset: -4px; width: calc(100% + 8px); height: calc(100% + 8px); opacity: 0; cursor: pointer; }
 
+.field-control.kind-switch { padding: 0 0 0 2px; border: 0; background: none; }
+.field-control.kind-switch:focus-within { border: 0; box-shadow: none; }
+.field-control.kind-switch input[type="checkbox"] {
+  position: absolute; width: 1px; height: 1px; margin: 0; padding: 0; opacity: 0; pointer-events: none;
+}
+.field-control.kind-switch .switch-track {
+  display: inline-flex; align-items: center; width: 38px; height: 21px; padding: 2px; border-radius: 999px;
+  background: color-mix(in srgb, var(--text-color) 17%, transparent); cursor: pointer;
+  transition: background 160ms ease;
+}
+.switch-thumb {
+  width: 17px; height: 17px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px color-mix(in srgb, #000 30%, transparent);
+  transition: transform 190ms cubic-bezier(.2, 1.2, .4, 1);
+}
+.field-control.kind-switch:has(input:checked) .switch-track { background: var(--accent-color); }
+.field-control.kind-switch:has(input:checked) .switch-track .switch-thumb { transform: translateX(17px); }
+.field-control.kind-switch:has(input:focus-visible) .switch-track { outline: 2px solid var(--accent-color); outline-offset: 2px; }
+
 .preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .preset-button {
   display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px 0 6px;

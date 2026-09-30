@@ -33,6 +33,36 @@ impl Rect {
     }
 }
 
+/// 复制成功提示固定贴在工作区右下角；如果会压住弹出面板或预览浮窗，
+/// 则改放左下角。两侧都会遮挡时选择遮挡面积更小的一侧，同面积优先右侧。
+pub fn toast_rect(work: Rect, obstacles: &[Rect], width: i32, height: i32, gap: i32) -> Rect {
+    let width = width.min(work.width() - 2 * gap).max(1);
+    let height = height.min(work.height() - 2 * gap).max(1);
+    let top = work.bottom - height - gap;
+    let right = Rect::new(work.right - width - gap, top, width, height);
+    let left = Rect::new(work.left + gap, top, width, height);
+    let overlap = |rect: &Rect| -> i64 {
+        obstacles
+            .iter()
+            .map(|obstacle| {
+                let guard = Rect {
+                    left: obstacle.left - gap / 2,
+                    top: obstacle.top - gap / 2,
+                    right: obstacle.right + gap / 2,
+                    bottom: obstacle.bottom + gap / 2,
+                };
+                rect.overlap_area(&guard)
+            })
+            .sum()
+    };
+    let right_overlap = overlap(&right);
+    if right_overlap == 0 || overlap(&left) >= right_overlap {
+        right
+    } else {
+        left
+    }
+}
+
 /// 预览默认放在工作区右下角；如果会挡住弹出面板，则改放左下角。
 /// 两侧都会遮挡时（例如面板很宽），选择遮挡面积更小的一侧，同面积优先右侧。
 pub fn preview_rect(work: Rect, popup: Rect, width: i32, height: i32, gap: i32) -> Rect {
@@ -62,7 +92,6 @@ pub fn preview_rect(work: Rect, popup: Rect, width: i32, height: i32, gap: i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     const WORK: Rect = Rect {
         left: 0,
         top: 0,
@@ -96,5 +125,29 @@ mod tests {
         let rect = preview_rect(small, Rect::new(0, 0, 1, 1), 480, 560, 16);
         assert_eq!((rect.width(), rect.height()), (268, 168));
         assert_eq!((rect.left, rect.top), (16, 16));
+    }
+
+    #[test]
+    fn toast_sticks_to_bottom_right_and_dodges_panels() {
+        let none = Vec::<Rect>::new();
+        let toast = |obstacles: &[Rect]| toast_rect(WORK, obstacles, 320, 96, 16);
+        assert_eq!(
+            toast(&none),
+            Rect::new(1920 - 320 - 16, 1040 - 96 - 16, 320, 96)
+        );
+
+        // 面板占住右下角时提示改放左下角。
+        let popup = Rect::new(1400, 400, 500, 620);
+        assert_eq!(toast(&[popup]).left, 16);
+
+        // 面板在左上角时提示仍然留在右下角。
+        let popup = Rect::new(0, 0, 400, 300);
+        assert_eq!(toast(&[popup]).left, 1920 - 320 - 16);
+
+        // 工作区比提示还小时夹紧尺寸，至少留 1 像素。
+        let small = Rect::new(0, 0, 300, 200);
+        let rect = toast_rect(small, &none, 320, 96, 16);
+        assert_eq!((rect.width(), rect.height()), (268, 96));
+        assert_eq!((rect.left, rect.top), (16, 88));
     }
 }

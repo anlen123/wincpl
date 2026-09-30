@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>剪藏 · 复制提示</title>
+  </head>
+  <body class="toast-body">
+    <div id="toast-card" class="toast-card" role="status" aria-live="polite">
+      <span id="toast-badge" class="toast-badge" aria-hidden="true">文</span>
+      <div class="toast-lines">
+        <p class="toast-title">
+          <span id="toast-title" class="toast-title-text">已复制到剪贴板</span>
+          <span id="toast-meta" class="toast-meta"></span>
+        </p>
+        <p id="toast-preview" class="toast-preview"></p>
+      </div>
+      <span class="toast-progress" aria-hidden="true"></span>
+    </div>
+    <script type="module" src="/src/toast.ts"></script>
+  </body>
+</html>
