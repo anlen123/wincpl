@@ -1,6 +1,6 @@
 [package]
 name = "jianzang"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Private Windows clipboard history with local OCR"
 

@@ -57,7 +57,7 @@ struct PreviewPayload {
 fn preview_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for term in query.split_whitespace() {
-        if term.is_empty() || term.chars().count() > 64 {
+        if term.starts_with('#') || term.chars().count() > 64 {
             continue;
         }
         let lowered = term.to_lowercase();
@@ -427,7 +427,7 @@ fn window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
         .ok_or_else(|| "主窗口不存在".into())
 }
 
-fn toggle(app: &tauri::AppHandle, snippets: bool) -> Result<(), String> {
+fn toggle(app: &tauri::AppHandle, snippets: bool, allow_hide: bool) -> Result<(), String> {
     // 单实例回调（例如用户连点两次启动图标）与全局快捷键都可能在
     // setup 里的 manage() 之前触发，此时状态还不存在；早期版本在这里
     // 直接取 state() 会 panic，而 panic 发生在 Windows 回调里无法 unwind，
@@ -443,7 +443,7 @@ fn toggle(app: &tauri::AppHandle, snippets: bool) -> Result<(), String> {
         return Ok(());
     }
     let visible = window.is_visible().map_err(|e| e.to_string())?;
-    if visible && state.snippet_mode.load(Ordering::Acquire) == snippets {
+    if allow_hide && visible && state.snippet_mode.load(Ordering::Acquire) == snippets {
         return hide_popup(app.clone());
     }
     if !visible {
@@ -762,6 +762,14 @@ fn list_tags(state: tauri::State<AppState>, snippets: bool) -> Result<Vec<TagCou
     lock(&state.store)?.list_tags(snippets)
 }
 
+/// 全局移除标签关联，不删除剪贴历史、图片或代码片段。
+#[tauri::command]
+fn delete_tag(app: tauri::AppHandle, tag: String) -> Result<(), String> {
+    lock(&app.state::<AppState>().store)?.delete_tag(&tag)?;
+    app.emit("history-changed", ()).map_err(|e| e.to_string())?;
+    app.emit("snippets-changed", ()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn delete_snippet(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     lock(&app.state::<AppState>().store)?.delete_snippet(id)?;
@@ -1007,7 +1015,7 @@ fn start_workers(
 pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Err(error) = toggle(app, false) {
+            if let Err(error) = toggle(app, false, true) {
                 report(app, error);
             }
         }))
@@ -1026,7 +1034,7 @@ pub fn run() {
                     }
                     let result = (|| {
                         let snippets = shortcuts(&*lock(&state.config)?)?[1] == *shortcut;
-                        toggle(app, snippets)
+                        toggle(app, snippets, true)
                     })();
                     if let Err(error) = result {
                         report(app, error);
@@ -1055,6 +1063,7 @@ pub fn run() {
             save_settings,
             set_entry_tags,
             list_tags,
+            delete_tag,
             phone_status,
             phone_regenerate
         ])
@@ -1118,6 +1127,22 @@ pub fn run() {
                 ))
                 .tooltip(format!("剪藏 · {}", config.hotkeys.toggle))
                 .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        let app = tray.app_handle();
+                        if let Err(error) = toggle(app, false, false) {
+                            report(app, error);
+                        }
+                    }
+                })
                 .on_menu_event(|app, event| {
                     let result = match event.id.as_ref() {
                         "quit" => {

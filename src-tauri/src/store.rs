@@ -154,9 +154,11 @@ fn push_search_conditions(
     tag: Option<&str>,
 ) {
     for term in search_terms(query) {
-        params.push(literal_like_pattern(&term));
+        let tag_term = term.strip_prefix('#').filter(|tag| !tag.is_empty());
+        params.push(literal_like_pattern(tag_term.unwrap_or(&term)));
         let index = params.len();
-        let alternatives = columns
+        let search_columns = if tag_term.is_some() { &["tags"][..] } else { columns };
+        let alternatives = search_columns
             .iter()
             .map(|column| format!("{column} LIKE ?{index} ESCAPE '\\' COLLATE NOCASE"))
             .collect::<Vec<_>>()
@@ -698,6 +700,38 @@ impl Store {
         }
         counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
         Ok(counts)
+    }
+
+    /// 在一个事务中移除历史和片段上的同名标签；不改变内容和时间戳。
+    pub fn delete_tag(&mut self, tag: &str) -> Result<usize, String> {
+        let names = normalize_tags(&[tag.to_string()])?;
+        let name = names.first().ok_or_else(|| "标签不能为空".to_string())?;
+        let key = name.to_lowercase();
+        let transaction = self.conn.transaction().map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        for table in ["entries", "snippets"] {
+            let mut statement = transaction
+                .prepare(&format!("SELECT id, tags FROM {table} WHERE tags <> ''"))
+                .map_err(|e| e.to_string())?;
+            let mut update = transaction
+                .prepare(&format!("UPDATE {table} SET tags = ?1 WHERE id = ?2"))
+                .map_err(|e| e.to_string())?;
+            let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let raw: String = row.get(1).map_err(|e| e.to_string())?;
+                if !raw.split(',').any(|tag| tag.to_lowercase() == key) {
+                    continue;
+                }
+                let mut tags = decode_tags(&raw);
+                tags.retain(|tag| tag.to_lowercase() != key);
+                changed += update
+                    .execute(params![encode_tags(&tags), id])
+                    .map_err(|e| format!("无法删除标签：{e}"))?;
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 
     /// 删掉带着 `tag` 标记、且写入时间早于 `ttl_secs` 的一次性验证码。
@@ -1368,5 +1402,70 @@ mod tests {
 
         store.set_max_items(1).expect("shrink retention");
         assert_eq!(store.list("", None, 20).expect("list shrunk").len(), 1);
+    }
+    #[test]
+    fn hashtag_queries_match_only_tags_and_combine_with_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        let tagged = store.insert_text("alpha 你好").unwrap();
+        store.set_entry_tags(tagged, &["Code-review".into(), "100%_".into()]).unwrap();
+        let body_only = store.insert_text("Code-review 100%_ alpha").unwrap();
+        store.set_entry_tags(body_only, &["Other".into()]).unwrap();
+        let snippet = store.upsert_snippet(None, "函数", "alpha sample", &["Code-review".into(), "100%_".into()]).unwrap();
+        store.upsert_snippet(None, "Code-review", "alpha 100%_", &["Other".into()]).unwrap();
+
+        let ids = |rows: Vec<Entry>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.list("#CODE alpha nihao", None, 20).unwrap()), [tagged]);
+        assert_eq!(ids(store.list("#100%_", None, 20).unwrap()), [tagged]);
+        assert!(store.list("#code missing", None, 20).unwrap().is_empty());
+        assert!(store.list("#code", Some("Other"), 20).unwrap().is_empty());
+        assert_eq!(store.list_snippets("#code alpha #100%_", None, 20).unwrap().iter().map(|row| row.id).collect::<Vec<_>>(), [snippet]);
+        assert!(store.list_snippets("#code missing", None, 20).unwrap().is_empty());
+        assert!(store.list_snippets("#code", Some("Other"), 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_tag_preserves_records_files_and_other_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        let text = store.insert_text("keep this text").unwrap();
+        let image = store.insert_image(&[255, 0, 0, 255], 1, 1).unwrap();
+        store.set_entry_tags(text, &["Work".into(), "Keep".into()]).unwrap();
+        store.set_entry_tags(image, &["work".into()]).unwrap();
+        let snippet = store.upsert_snippet(None, "keep title", "keep content", &["WORK".into(), "Workshop".into()]).unwrap();
+        let mut expected_text = store.get(text).unwrap();
+        let mut expected_image = store.get(image).unwrap();
+        let expected_snippet = store.get_snippet(snippet).unwrap();
+        expected_text.tags = vec!["Keep".into()];
+        expected_image.tags.clear();
+
+        assert_eq!(store.delete_tag("#wOrK").unwrap(), 3);
+        assert_eq!(store.get(text).unwrap(), expected_text);
+        assert_eq!(store.get(image).unwrap(), expected_image);
+        assert!(Path::new(expected_image.image_path.as_ref().unwrap()).is_file());
+        assert!(Path::new(expected_image.thumbnail_path.as_ref().unwrap()).is_file());
+        let actual_snippet = store.get_snippet(snippet).unwrap();
+        assert_eq!(actual_snippet.title, expected_snippet.title);
+        assert_eq!(actual_snippet.content, expected_snippet.content);
+        assert_eq!(actual_snippet.created_at, expected_snippet.created_at);
+        assert_eq!(actual_snippet.updated_at, expected_snippet.updated_at);
+        assert_eq!(actual_snippet.tags, ["Workshop"]);
+        assert_eq!(store.list_tags(false).unwrap(), [TagCount { name: "Keep".into(), count: 1 }]);
+        assert_eq!(store.list_tags(true).unwrap(), [TagCount { name: "Workshop".into(), count: 1 }]);
+        assert_eq!(store.delete_tag("work").unwrap(), 0);
+        assert!(store.delete_tag("#").is_err());
+    }
+
+    #[test]
+    fn deleting_tag_rolls_back_both_scopes_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), 100).unwrap();
+        let entry = store.insert_text("original").unwrap();
+        store.set_entry_tags(entry, &["工作".into()]).unwrap();
+        let snippet = store.upsert_snippet(None, "original", "content", &["工作".into()]).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER block_tag_delete BEFORE UPDATE OF tags ON snippets BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+        assert!(store.delete_tag("工作").is_err());
+        assert_eq!(store.get(entry).unwrap().tags, ["工作"]);
+        assert_eq!(store.get_snippet(snippet).unwrap().tags, ["工作"]);
     }
 }
