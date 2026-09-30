@@ -376,6 +376,39 @@ fn digits_only(value: &str) -> String {
     value.chars().filter(char::is_ascii_digit).collect()
 }
 
+/// 拥有监听线程；销毁时等待旧线程释放端口，再允许启动新监听。
+pub struct RelayServer {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RelayServer {
+    pub fn start(
+        listener: TcpListener,
+        context: Arc<RelayContext>,
+        on_sms: impl Fn(RelaySms) + Send + 'static,
+        on_exit: impl FnOnce(std::io::Result<()>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("phone-relay".into())
+            .spawn(move || {
+                on_exit(serve(listener, context, server_stop, on_sms));
+            })?;
+        Ok(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for RelayServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// 在后台线程里跑监听循环，直到 `stop` 被置位。
 pub fn serve(
     listener: TcpListener,
@@ -657,7 +690,7 @@ mod tests {
     #[test]
     fn serves_a_real_round_trip_over_tcp() {
         let listener = bind(0).unwrap();
-        let address = listener.local_addr().unwrap();
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
         let context = Arc::new(context());
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -699,5 +732,34 @@ mod tests {
         let recorded = seen.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].code, "998877");
+    }
+
+    #[test]
+    fn rotating_token_releases_port_and_rejects_old_phone() {
+        fn ping(address: SocketAddr, token: &str) -> String {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            write!(stream, "GET /api/v1/ping HTTP/1.1\r\nHost: x\r\nX-Jianzang-Token: {token}\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let listener = bind(0).unwrap();
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
+        let mut current = context();
+        let mut server = RelayServer::start(listener, Arc::new(current.clone()), |_| {}, |_| {}).unwrap();
+        assert!(ping(address, &current.token).starts_with("HTTP/1.1 200 OK"));
+        for _ in 0..5 {
+            let old_token = current.token.clone();
+            drop(server);
+            let listener = bind(address.port()).expect("旧监听必须在重启前释放端口");
+            current.token = random_token();
+            server = RelayServer::start(listener, Arc::new(current.clone()), |_| {}, |_| {}).unwrap();
+            assert!(ping(address, &old_token).starts_with("HTTP/1.1 401 Unauthorized"));
+            assert!(ping(address, &current.token).starts_with("HTTP/1.1 200 OK"));
+        }
+        drop(server);
+        assert!(TcpStream::connect(address).is_err());
     }
 }
