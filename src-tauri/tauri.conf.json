@@ -11,19 +11,19 @@
   },
   "app": {
     "windows": [{
-      "label": "main", "title": "剪藏", "width": 400, "height": 560,
+      "label": "main", "create": false, "title": "剪藏", "width": 400, "height": 560,
       "visible": false, "transparent": true, "decorations": false,
       "resizable": false, "alwaysOnTop": true, "skipTaskbar": true,
       "shadow": true, "backgroundColor": "#00000000",
       "windowEffects": { "effects": ["acrylic"], "color": [243, 242, 234, 160] }
     }, {
-      "label": "preview", "title": "剪藏 · 完整预览", "url": "preview.html",
+      "label": "preview", "create": false, "title": "剪藏 · 完整预览", "url": "preview.html",
       "width": 480, "height": 560, "visible": false, "focus": false,
       "transparent": true, "decorations": false, "resizable": false,
       "alwaysOnTop": true, "skipTaskbar": true,
       "backgroundColor": "#00000000"
     }, {
-      "label": "toast", "title": "剪藏 · 复制提示", "url": "toast.html",
+      "label": "toast", "create": false, "title": "剪藏 · 复制提示", "url": "toast.html",
       "width": 360, "height": 110, "visible": false, "focus": false,
       "transparent": true, "decorations": false, "resizable": false,
       "alwaysOnTop": true, "skipTaskbar": true, "shadow": false,

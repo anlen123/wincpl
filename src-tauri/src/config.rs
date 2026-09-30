@@ -464,6 +464,26 @@ fn validate_shortcut_shape(name: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn webviews_must_wait_until_app_state_is_managed() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = config
+            .get("app")
+            .and_then(|app| app.get("windows"))
+            .and_then(serde_json::Value::as_array)
+            .expect("window configuration");
+        assert_eq!(windows.len(), 3);
+        for window in windows {
+            assert_eq!(
+                window.get("create").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "{:?} must not start WebView callbacks before AppState is managed",
+                window.get("label")
+            );
+        }
+    }
+
+    #[test]
     fn existing_yaml_preserves_settings_when_display_limit_is_missing() {
         let source = DEFAULT_CONFIG
             .replace("  display_limit: 20\n", "")

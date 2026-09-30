@@ -18,6 +18,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 struct AppState {
+    ready: AtomicBool,
     config: Mutex<Config>,
     store: Mutex<Store>,
     config_path: PathBuf,
@@ -423,8 +424,17 @@ fn window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
 }
 
 fn toggle(app: &tauri::AppHandle, snippets: bool) -> Result<(), String> {
+    // 单实例回调（例如用户连点两次启动图标）与全局快捷键都可能在
+    // setup 里的 manage() 之前触发，此时状态还不存在；早期版本在这里
+    // 直接取 state() 会 panic，而 panic 发生在 Windows 回调里无法 unwind，
+    // 整个程序会以 0xc0000409 直接崩掉。
+    let Some(state) = app.try_state::<AppState>() else {
+        return Ok(());
+    };
+    if !state.ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let window = window(app)?;
-    let state = app.state::<AppState>();
     if state.pasting.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -490,7 +500,9 @@ fn hide_popup(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn clear_preview(app: &tauri::AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let Some(state) = app.try_state::<AppState>() else {
+        return Ok(());
+    };
     *lock(&state.preview)? = None;
     *lock(&state.preview_terms)? = Vec::new();
     if let Some(preview) = app.get_webview_window("preview") {
@@ -998,15 +1010,22 @@ pub fn run() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        let result = (|| {
-                            let state = app.state::<AppState>();
-                            let snippets = shortcuts(&*lock(&state.config)?)?[1] == *shortcut;
-                            toggle(app, snippets)
-                        })();
-                        if let Err(error) = result {
-                            report(app, error);
-                        }
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    // 同上：快捷键可能先于 manage() 触发，拿不到状态就忽略。
+                    let Some(state) = app.try_state::<AppState>() else {
+                        return;
+                    };
+                    if !state.ready.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let result = (|| {
+                        let snippets = shortcuts(&*lock(&state.config)?)?[1] == *shortcut;
+                        toggle(app, snippets)
+                    })();
+                    if let Err(error) = result {
+                        report(app, error);
                     }
                 })
                 .build(),
@@ -1044,6 +1063,7 @@ pub fn run() {
             let store = Store::open(&dir, config.history.max_items)?;
             let (ocr_wake, ocr_rx) = sync_channel(1);
             app.manage(AppState {
+                ready: AtomicBool::new(false),
                 config: Mutex::new(config.clone()),
                 store: Mutex::new(store),
                 config_path,
@@ -1061,6 +1081,12 @@ pub fn run() {
                 phone_stop: Mutex::new(None),
                 phone_state: Mutex::new(PhoneRuntime::default()),
             });
+            // 配置窗口使用 create:false：Tauri 默认在用户 setup 前创建窗口，
+            // WebView 的 IPC/原生事件可能重入并读取尚未 manage 的 AppState。
+            // 必须先注册状态，再创建任何 WebView（不能靠延时碰运气）。
+            for config in app.config().app.windows.clone() {
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
+            }
             let popup = window(app.handle())?;
             popup.set_size(tauri::LogicalSize::new(
                 config.appearance.width,
@@ -1111,9 +1137,22 @@ pub fn run() {
                 report(app.handle(), error);
             }
             sync_phone(app.handle());
+            state.ready.store(true, Ordering::Release);
             Ok(())
         })
-        .on_window_event(|window, event| match event {
+        .on_window_event(|window, event| {
+            // 复制提示不属于可交互的 picker；其焦点/关闭事件不应关闭面板。
+            // 初始化前的原生事件也不能进入依赖 AppState 的路径。
+            if !matches!(window.label(), "main" | "preview") {
+                return;
+            }
+            let Some(state) = window.app_handle().try_state::<AppState>() else {
+                return;
+            };
+            if !state.ready.load(Ordering::Acquire) {
+                return;
+            }
+            match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = hide_popup(window.app_handle().clone());
@@ -1133,7 +1172,8 @@ pub fn run() {
                     }
                 });
             }
-            _ => {}
+                _ => {}
+            }
         })
         .run(tauri::generate_context!());
     if let Err(error) = result {
