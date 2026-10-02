@@ -127,6 +127,7 @@ const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
 let entries: Entry[] = [];
 let tagCounts: TagCount[] = [];
 let activeTag: string | null = null;
+let deletingTag: string | null = null;
 let selectedId: number | null = null;
 let displayedQuery = "";
 let displayedTag: string | null = null;
@@ -417,7 +418,22 @@ function renderTagBar(): void {
       chip.append(badge);
     }
     chip.addEventListener("click", () => setTagFilter(tag));
-    tagBar.append(chip);
+    if (tag === null) {
+      tagBar.append(chip);
+    } else {
+      const group = document.createElement("span");
+      group.className = "tag-filter-group";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "tag-delete";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", `删除标签 #${tag}`);
+      remove.title = `删除 #${tag}，保留所有剪贴历史与代码片段`;
+      remove.disabled = !hasNativeBackend || deletingTag !== null;
+      remove.addEventListener("click", () => void deleteTag(tag));
+      group.append(chip, remove);
+      tagBar.append(group);
+    }
     if (pressed) requestAnimationFrame(() => chip.scrollIntoView({ block: "nearest", inline: "nearest" }));
   }
 }
@@ -437,6 +453,26 @@ function cycleTagFilter(direction: 1 | -1): void {
   if (options.length <= 1) return;
   const current = Math.max(0, options.findIndex((tag) => sameTag(tag, activeTag)));
   setTagFilter(options[(current + direction + options.length) % options.length] ?? null);
+}
+
+async function deleteTag(tag: string): Promise<void> {
+  if (!hasNativeBackend || deletingTag !== null) return;
+  if (!window.confirm(`删除标签 #${tag}？\n将从所有剪贴历史和代码片段中移除此标签，记录内容保留。`)) return;
+  deletingTag = tag;
+  renderTagBar();
+  try {
+    await invoke("delete_tag", { tag });
+    if (sameTag(activeTag, tag)) activeTag = null;
+    resetSelectionPending = true;
+    window.clearTimeout(searchTimer);
+    await loadEntries();
+    searchInput.focus();
+  } catch (error) {
+    showError(error);
+  } finally {
+    deletingTag = null;
+    renderTagBar();
+  }
 }
 
 async function loadTags(): Promise<TagCount[]> {
@@ -1123,7 +1159,7 @@ function resetForPopup(nextMode: Mode = "clipboard"): void {
   snippetTools.hidden = mode !== "snippets";
   root.dataset.mode = mode;
   updateModeLabels();
-  searchInput.placeholder = mode === "snippets" ? "搜索标题、内容或标签 · 空格分隔多个关键词" : "搜索剪贴板 · 空格分隔多个关键词";
+  searchInput.placeholder = mode === "snippets" ? "搜索标题、内容 · #标签 · 空格分隔关键词" : "搜索剪贴板 · #标签 · 空格分隔关键词";
   historyList.setAttribute("aria-label", mode === "snippets" ? "代码片段" : "剪贴板记录");
   searchInput.setAttribute("aria-label", searchInput.placeholder);
   requireElement("history-settings").hidden = mode === "snippets";
@@ -1279,7 +1315,10 @@ function handleKeyboard(event: KeyboardEvent): void {
     openTagEditor();
     return;
   }
-  if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+  const tagArrow = event.key === "ArrowLeft" || event.key === "ArrowRight";
+  const plainTagArrow = !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey
+    && (event.target !== searchInput || searchInput.value.length === 0);
+  if (tagArrow && (plainTagArrow || (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey))) {
     event.preventDefault();
     cycleTagFilter(event.key === "ArrowRight" ? 1 : -1);
     return;
