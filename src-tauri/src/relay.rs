@@ -11,7 +11,7 @@ use std::{
     collections::hash_map::RandomState,
     hash::{BuildHasher, Hasher},
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -108,7 +108,11 @@ pub fn random_token() -> String {
     for _ in 0..2 {
         let mut state = RandomState::new().build_hasher();
         state.write_u64(0x9e37_79b9_7f4a_7c15);
-        state.write_u64(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64));
+        state.write_u64(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64),
+        );
         hasher.update(state.finish().to_le_bytes());
     }
     hasher.update(std::process::id().to_le_bytes());
@@ -130,17 +134,6 @@ pub fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-/// 找出本机用来出网的局域网 IPv4 地址；没有默认路由时返回 None。
-pub fn lan_ipv4() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    // UDP connect 不会发包，只是让系统按路由选出网卡。
-    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
-        _ => None,
-    }
 }
 
 fn percent_encode(value: &str) -> String {
@@ -376,6 +369,42 @@ fn digits_only(value: &str) -> String {
     value.chars().filter(char::is_ascii_digit).collect()
 }
 
+/// 拥有监听线程；销毁时等待旧线程释放端口，再允许启动新监听。
+pub struct RelayServer {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RelayServer {
+    pub fn start(
+        listener: TcpListener,
+        context: Arc<RelayContext>,
+        on_sms: impl Fn(RelaySms) + Send + 'static,
+        on_exit: impl FnOnce(std::io::Result<()>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("phone-relay".into())
+            .spawn(move || {
+                on_exit(serve(listener, context, server_stop, on_sms));
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RelayServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// 在后台线程里跑监听循环，直到 `stop` 被置位。
 pub fn serve(
     listener: TcpListener,
@@ -526,10 +555,7 @@ mod tests {
             extract_code("验证码 1 2 3 4 5 6，请在两分钟内输入").as_deref(),
             Some("123456")
         );
-        assert_eq!(
-            extract_code("验证码：123 456").as_deref(),
-            Some("123456")
-        );
+        assert_eq!(extract_code("验证码：123 456").as_deref(), Some("123456"));
         assert_eq!(extract_code("验证码为 12-34").as_deref(), Some("1234"));
     }
 
@@ -643,7 +669,13 @@ mod tests {
         let bad_json = route(&context, "POST", "/api/v1/sms", Some(&token), "{oops");
         assert_eq!(bad_json.status, 400);
 
-        let no_code = route(&context, "POST", "/api/v1/sms", Some(&token), "{\"text\":\"你好\"}");
+        let no_code = route(
+            &context,
+            "POST",
+            "/api/v1/sms",
+            Some(&token),
+            "{\"text\":\"你好\"}",
+        );
         assert_eq!(no_code.status, 422);
 
         let unknown = route(&context, "GET", "/api/v1/other", Some(&token), "");
@@ -657,7 +689,9 @@ mod tests {
     #[test]
     fn serves_a_real_round_trip_over_tcp() {
         let listener = bind(0).unwrap();
-        let address = listener.local_addr().unwrap();
+        // 0.0.0.0 是监听地址，不是客户端目标地址（Windows 会拒绝连接）。
+        let address =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
         let context = Arc::new(context());
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -699,5 +733,43 @@ mod tests {
         let recorded = seen.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].code, "998877");
+    }
+
+    #[test]
+    fn rotating_token_releases_port_and_rejects_old_phone() {
+        fn ping(address: SocketAddr, token: &str) -> String {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /api/v1/ping HTTP/1.1\r\nHost: x\r\nX-Jianzang-Token: {token}\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let listener = bind(0).unwrap();
+        let address =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
+        let mut current = context();
+        let mut server =
+            RelayServer::start(listener, Arc::new(current.clone()), |_| {}, |_| {}).unwrap();
+        assert!(ping(address, &current.token).starts_with("HTTP/1.1 200 OK"));
+        for _ in 0..5 {
+            let old_token = current.token.clone();
+            drop(server);
+            let listener = bind(address.port()).expect("旧监听必须在重启前释放端口");
+            current.token = random_token();
+            server =
+                RelayServer::start(listener, Arc::new(current.clone()), |_| {}, |_| {}).unwrap();
+            assert!(ping(address, &old_token).starts_with("HTTP/1.1 401 Unauthorized"));
+            assert!(ping(address, &current.token).starts_with("HTTP/1.1 200 OK"));
+        }
+        drop(server);
+        assert!(TcpStream::connect(address).is_err());
     }
 }

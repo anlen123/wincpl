@@ -1,13 +1,19 @@
 package com.jianzang.phone
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /** 电脑端生成的一条配对信息。 */
-data class Pairing(val host: String, val port: Int, val token: String, val name: String) {
+data class Pairing(
+    val host: String,
+    val port: Int,
+    val token: String,
+    val name: String,
+) {
     val link: String
         get() = "jianzang://pair?host=$host&port=$port&token=$token&name=${Uri.encode(name)}"
 
@@ -27,7 +33,7 @@ object PairingStore {
     private const val KEY_NAME = "name"
     private const val KEY_ENABLED = "enabled"
     private const val KEY_LOG = "log"
-    private const val LOG_LIMIT = 20
+    private const val LOG_LIMIT = 100
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -40,8 +46,12 @@ object PairingStore {
         return Pairing(host, port, token, store.getString(KEY_NAME, null) ?: "剪藏")
     }
 
-    fun save(context: Context, pairing: Pairing) {
-        prefs(context).edit()
+    fun save(
+        context: Context,
+        pairing: Pairing,
+    ) {
+        prefs(context)
+            .edit()
             .putString(KEY_HOST, pairing.host)
             .putInt(KEY_PORT, pairing.port)
             .putString(KEY_TOKEN, pairing.token)
@@ -66,16 +76,37 @@ object PairingStore {
 
     fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY_ENABLED, false)
 
-    fun setEnabled(context: Context, enabled: Boolean) {
+    fun setEnabled(
+        context: Context,
+        enabled: Boolean,
+    ) {
         prefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply()
     }
 
-    fun log(context: Context): List<String> =
-        prefs(context).getString(KEY_LOG, "")?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
+    fun log(context: Context): List<String> = prefs(context).getString(KEY_LOG, "")?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
 
-    fun appendLog(context: Context, line: String) {
+    // 广播线程和界面线程可能同时追加；串行读改写，避免丢失诊断记录。
+    @Synchronized
+    fun appendLog(
+        context: Context,
+        line: String,
+    ) {
         val stamp = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(Date())
-        val lines = (listOf("$stamp $line") + log(context)).take(LOG_LIMIT)
+        val lines = (listOf("$stamp ${line.replace('\n', ' ').replace('\r', ' ')}") + log(context)).take(LOG_LIMIT)
         prefs(context).edit().putString(KEY_LOG, lines.joinToString("\n")).apply()
+    }
+
+    fun observe(
+        context: Context,
+        listener: SharedPreferences.OnSharedPreferenceChangeListener,
+    ) {
+        prefs(context).registerOnSharedPreferenceChangeListener(listener)
+    }
+
+    fun unobserve(
+        context: Context,
+        listener: SharedPreferences.OnSharedPreferenceChangeListener,
+    ) {
+        prefs(context).unregisterOnSharedPreferenceChangeListener(listener)
     }
 }

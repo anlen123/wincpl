@@ -17,7 +17,11 @@
     <string name="enable">启用短信转发</string>
     <string name="enable_hint">只转发含「验证码」等字样的短信，验证码在电脑上只会短暂保留，到期自动清除。需要「读取短信」权限，手机不会把短信发给除你电脑以外的任何地方。</string>
 
-    <string name="log_title">最近记录</string>
+    <string name="diagnose">检查状态 / 补授短信权限</string>
+    <string name="copy_logs">复制诊断日志</string>
+    <string name="logs_copied">诊断日志已复制，请检查后再分享</string>
+    <string name="log_hint">最近 100 条记录，收到短信时自动刷新。不记录短信正文、号码或验证码。若连“收到短信广播”都没有，请检查短信权限、自启动和后台省电限制；强行停止应用后需重新打开。聊天应用或 RCS 消息不一定触发短信广播。</string>
+    <string name="log_title">最近记录 · 短信诊断</string>
     <string name="log_empty">暂无记录</string>
 
     <string name="manual_title">粘贴配对链接</string>
@@ -28,7 +32,7 @@
 
     <string name="toast_bad_qr">这不是剪藏的配对二维码</string>
     <string name="toast_paired">已配对 %1$s</string>
-    <string name="toast_no_permission">没有「读取短信」权限，无法转发验证码</string>
+    <string name="toast_no_permission">没有「接收短信」权限，无法转发验证码，请到系统应用权限中允许短信</string>
     <string name="toast_no_pairing">先扫码配对，再打开开关</string>
     <string name="toast_testing">正在连接电脑…</string>
 

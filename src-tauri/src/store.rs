@@ -82,7 +82,10 @@ pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
         {
             return Err(format!("标签“{tag}”不能包含逗号、空格或控制字符"));
         }
-        if !result.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+        if !result
+            .iter()
+            .any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
             result.push(tag.to_string());
         }
     }
@@ -123,7 +126,10 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, Stri
 fn search_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for term in query.split_whitespace() {
-        if !terms.iter().any(|t| t.to_lowercase() == term.to_lowercase()) {
+        if !terms
+            .iter()
+            .any(|t| t.to_lowercase() == term.to_lowercase())
+        {
             terms.push(term.to_string());
         }
         if terms.len() == MAX_SEARCH_TERMS {
@@ -690,9 +696,15 @@ impl Store {
         for row in rows {
             for tag in decode_tags(&row.map_err(|e| e.to_string())?) {
                 let key = tag.to_lowercase();
-                match counts.iter_mut().find(|item| item.name.to_lowercase() == key) {
+                match counts
+                    .iter_mut()
+                    .find(|item| item.name.to_lowercase() == key)
+                {
                     Some(item) => item.count += 1,
-                    None => counts.push(TagCount { name: tag, count: 1 }),
+                    None => counts.push(TagCount {
+                        name: tag,
+                        count: 1,
+                    }),
                 }
             }
         }
@@ -1167,7 +1179,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [image, text]
         );
-        assert_eq!(store.list("nihao Rust 100%_", None, 20).unwrap()[0].id, text);
+        assert_eq!(
+            store.list("nihao Rust 100%_", None, 20).unwrap()[0].id,
+            text
+        );
         assert_eq!(store.list("你好", None, 1).unwrap()[0].id, image);
         store.retry_ocr(image).unwrap();
         assert_eq!(
@@ -1193,7 +1208,11 @@ mod tests {
         for index in 0..30 {
             store.insert_text(&format!("记录{index}")).unwrap();
         }
-        assert!(!store.list("", None, 20).unwrap().iter().any(|e| e.id == old));
+        assert!(!store
+            .list("", None, 20)
+            .unwrap()
+            .iter()
+            .any(|e| e.id == old));
         assert_eq!(store.list("隐藏", None, 20).unwrap()[0].id, old);
         store.touch(old).unwrap();
         assert_eq!(store.list("", None, 10).unwrap()[0].id, old);
@@ -1278,13 +1297,19 @@ mod tests {
         let chinese = store.insert_text("你好 世界 rust").unwrap();
         let ids = |entries: Vec<Entry>| entries.iter().map(|e| e.id).collect::<Vec<_>>();
         assert_eq!(ids(store.list("alpha  beta", None, 20).unwrap()), [ab, abc]);
-        assert_eq!(ids(store.list("gamma alpha beta", None, 20).unwrap()), [abc]);
+        assert_eq!(
+            ids(store.list("gamma alpha beta", None, 20).unwrap()),
+            [abc]
+        );
         assert_eq!(ids(store.list("nihao RUST", None, 20).unwrap()), [chinese]);
         assert!(store.list("alpha rust", None, 20).unwrap().is_empty());
 
         assert_eq!(
             store
-                .set_entry_tags(abc, &["#工作".into(), "code".into(), "CODE".into(), " ".into()])
+                .set_entry_tags(
+                    abc,
+                    &["#工作".into(), "code".into(), "CODE".into(), " ".into()]
+                )
                 .unwrap(),
             ["工作", "code"]
         );
@@ -1298,8 +1323,14 @@ mod tests {
         assert_eq!(
             store.list_tags(false).unwrap(),
             [
-                TagCount { name: "code".into(), count: 2 },
-                TagCount { name: "工作".into(), count: 1 }
+                TagCount {
+                    name: "code".into(),
+                    count: 2
+                },
+                TagCount {
+                    name: "工作".into(),
+                    count: 1
+                }
             ]
         );
 

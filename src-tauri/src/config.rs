@@ -222,7 +222,11 @@ impl Config {
         if !self.phone.token.is_empty()
             && (self.phone.token.len() < 16
                 || self.phone.token.len() > 64
-                || !self.phone.token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+                || !self
+                    .phone
+                    .token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()))
         {
             return Err("phone.token 必须是 16 到 64 位的字母或数字".into());
         }
@@ -304,7 +308,11 @@ impl Config {
             ("appearance", "muted_color", quote(&a.muted_color)),
             ("appearance", "background_color", quote(&a.background_color)),
             ("appearance", "selected_color", quote(&a.selected_color)),
-            ("appearance", "selected_border_color", quote(&a.selected_border_color)),
+            (
+                "appearance",
+                "selected_border_color",
+                quote(&a.selected_border_color),
+            ),
             ("appearance", "card_color", quote(&a.card_color)),
             ("appearance", "border_color", quote(&a.border_color)),
             ("appearance", "accent_color", quote(&a.accent_color)),
@@ -312,17 +320,33 @@ impl Config {
             ("appearance", "font_size", a.font_size.to_string()),
             ("appearance", "width", a.width.to_string()),
             ("appearance", "height", a.height.to_string()),
-            ("history", "display_limit", self.history.display_limit.to_string()),
+            (
+                "history",
+                "display_limit",
+                self.history.display_limit.to_string(),
+            ),
             ("history", "max_items", self.history.max_items.to_string()),
-            ("history", "max_image_mb", self.history.max_image_mb.to_string()),
-            ("history", "max_text_kb", self.history.max_text_kb.to_string()),
+            (
+                "history",
+                "max_image_mb",
+                self.history.max_image_mb.to_string(),
+            ),
+            (
+                "history",
+                "max_text_kb",
+                self.history.max_text_kb.to_string(),
+            ),
             ("ocr", "language", quote(&self.ocr.language)),
             ("notify", "enabled", self.notify.enabled.to_string()),
             ("notify", "duration_ms", self.notify.duration_ms.to_string()),
             ("phone", "enabled", self.phone.enabled.to_string()),
             ("phone", "port", self.phone.port.to_string()),
             ("phone", "token", quote(&self.phone.token)),
-            ("phone", "code_ttl_secs", self.phone.code_ttl_secs.to_string()),
+            (
+                "phone",
+                "code_ttl_secs",
+                self.phone.code_ttl_secs.to_string(),
+            ),
         ]
     }
 }

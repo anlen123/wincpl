@@ -955,13 +955,14 @@ function renderPhoneLast(): void {
 
 function phoneStateTextOf(status: PhoneStatus | null): string {
   if (!status || !status.enabled) return "未开启 · 打开上面的开关后开始监听";
+  if (status.error) return status.error;
   if (status.running) return "正在监听 · 等手机发来验证码";
-  return status.error ?? "监听未启动";
+  return "监听未启动";
 }
 
 function phoneTone(status: PhoneStatus | null): string {
   if (!status?.enabled) return "off";
-  return status.running ? "on" : "error";
+  return status.running && !status.error ? "on" : "error";
 }
 
 function renderPhoneStatus(): void {
@@ -976,7 +977,9 @@ function renderPhoneStatus(): void {
   phoneQr.hidden = !qr;
   if (qr) phoneQr.src = qr;
   phoneQrFallback.hidden = Boolean(qr);
-  phoneQrFallback.textContent = enabled ? "二维码生成失败，请用下方链接手动配对" : "打开「启用手机接入」后生成二维码";
+  phoneQrFallback.textContent = enabled
+    ? phoneStatus?.error ?? "二维码生成失败，请用下方链接手动配对"
+    : "打开「启用手机接入」后生成二维码";
   phoneRegenerate.disabled = !hasNativeBackend || !token;
   renderPhoneLast();
 }

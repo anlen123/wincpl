@@ -33,7 +33,7 @@ struct AppState {
     preview_terms: Mutex<Vec<String>>,
     toast_sequence: AtomicU32,
     toast_generation: AtomicU32,
-    phone_stop: Mutex<Option<Arc<AtomicBool>>>,
+    phone_server: Mutex<Option<relay::RelayServer>>,
     phone_state: Mutex<PhoneRuntime>,
 }
 
@@ -127,7 +127,10 @@ fn notify_copied(app: &tauri::AppHandle, kind: &str, preview: String, detail: St
         report(app, error);
     }
     let _ = toast.emit("toast-changed", &payload);
-    let generation = state.toast_generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    let generation = state
+        .toast_generation
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     let app = app.clone();
     let duration = Duration::from_millis(u64::from(notify.duration_ms));
     let _ = std::thread::Builder::new()
@@ -181,11 +184,9 @@ struct PhoneStatus {
     error: Option<String>,
 }
 
-/// 局域网访问地址；拿不到本机地址时回落到 127.0.0.1（手机连不上，界面上会提醒）。
-fn phone_host() -> String {
-    relay::lan_ipv4()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into())
+/// 只使用物理 Wi-Fi/以太网的局域网地址，不回退到代理或回环地址。
+fn phone_host() -> Option<String> {
+    crate::lan::lan_ipv4().map(|ip| ip.to_string())
 }
 
 /// 配对令牌为空时现场生成并写回 config.yaml，让二维码扫码即用。
@@ -204,8 +205,11 @@ fn phone_snapshot(app: &tauri::AppHandle) -> Result<PhoneStatus, String> {
     let state = app.state::<AppState>();
     let phone = lock(&state.config)?.phone.clone();
     let host = phone_host();
-    let pairing = relay::pairing_payload(&host, phone.port, &phone.token, PHONE_DEVICE_NAME);
-    let qr = if phone.token.is_empty() {
+    let pairing = host
+        .as_deref()
+        .map(|host| relay::pairing_payload(host, phone.port, &phone.token, PHONE_DEVICE_NAME))
+        .unwrap_or_default();
+    let qr = if phone.token.is_empty() || pairing.is_empty() {
         String::new()
     } else {
         relay::qr_data_uri(&pairing).unwrap_or_default()
@@ -214,13 +218,17 @@ fn phone_snapshot(app: &tauri::AppHandle) -> Result<PhoneStatus, String> {
     Ok(PhoneStatus {
         enabled: phone.enabled,
         running: runtime.running,
-        address: format!("{host}:{}", phone.port),
+        address: host.as_ref().map(|host| format!("{host}:{}", phone.port))
+            .unwrap_or_else(|| "未检测到物理局域网 IPv4 地址".into()),
         token: phone.token,
         pairing,
         qr,
         code_ttl_secs: phone.code_ttl_secs,
         last: runtime.last.clone(),
-        error: runtime.error.clone(),
+        error: runtime.error.clone().or_else(|| {
+            (phone.enabled && host.is_none()).then(||
+                "未找到已连接的物理 Wi-Fi/以太网私有 IPv4 地址，请检查网卡和网络连接；不生成虚拟网卡配对二维码".into())
+        }),
     })
 }
 
@@ -248,13 +256,15 @@ fn phone_regenerate(app: tauri::AppHandle) -> Result<PhoneStatus, String> {
 /// 按当前配置起停手机验证码监听；配置变化时先停旧的，再按需起新的。
 fn sync_phone(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
-    if let Ok(mut slot) = state.phone_stop.lock() {
-        if let Some(stop) = slot.take() {
-            stop.store(true, Ordering::Release);
-        }
-    }
+    // 持有生命周期锁直到新线程安装完成，防止并发设置变更交错起停。
+    let mut server = match lock(&state.phone_server) {
+        Ok(server) => server,
+        Err(error) => return report(app, error),
+    };
+    drop(server.take());
     if let Ok(mut runtime) = state.phone_state.lock() {
         runtime.running = false;
+        runtime.error = None;
     }
     let phone = match lock(&state.config) {
         Ok(config) => config.phone.clone(),
@@ -273,7 +283,7 @@ fn sync_phone(app: &tauri::AppHandle) {
     let context = Arc::new(RelayContext {
         token,
         version: env!("CARGO_PKG_VERSION").into(),
-        host: phone_host(),
+        host: phone_host().unwrap_or_default(),
         port,
     });
     let listener = match relay::bind(port) {
@@ -287,22 +297,17 @@ fn sync_phone(app: &tauri::AppHandle) {
             return report(app, message);
         }
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    if let Ok(mut slot) = state.phone_stop.lock() {
-        *slot = Some(stop.clone());
-    }
     if let Ok(mut runtime) = state.phone_state.lock() {
         runtime.running = true;
         runtime.error = None;
     }
     let server_app = app.clone();
-    let spawned = std::thread::Builder::new()
-        .name("phone-relay".into())
-        .spawn(move || {
-            let handler_app = server_app.clone();
-            let result = relay::serve(listener, context, stop, move |sms| {
-                on_phone_code(&handler_app, sms, ttl);
-            });
+    let handler_app = server_app.clone();
+    let spawned = relay::RelayServer::start(
+        listener,
+        context,
+        move |sms| on_phone_code(&handler_app, sms, ttl),
+        move |result| {
             if let Err(error) = result {
                 report(&server_app, format!("手机验证码监听已停止：{error}"));
             }
@@ -311,9 +316,17 @@ fn sync_phone(app: &tauri::AppHandle) {
                 runtime.running = false;
             }
             let _ = server_app.emit("phone-changed", ());
-        });
-    if let Err(error) = spawned {
-        report(app, error);
+        },
+    );
+    match spawned {
+        Ok(started) => *server = Some(started),
+        Err(error) => {
+            if let Ok(mut runtime) = state.phone_state.lock() {
+                runtime.running = false;
+                runtime.error = Some(error.to_string());
+            }
+            report(app, error);
+        }
     }
     let _ = app.emit("phone-changed", ());
 }
@@ -392,11 +405,7 @@ fn expire_code(app: &tauri::AppHandle, id: i64, code: String, stamp: i64, ttl_se
                 }
             }
             if let Ok(mut runtime) = state.phone_state.lock() {
-                if runtime
-                    .last
-                    .as_ref()
-                    .is_some_and(|last| last.code == code)
-                {
+                if runtime.last.as_ref().is_some_and(|last| last.code == code) {
                     runtime.last = None;
                 }
             }
@@ -1078,7 +1087,7 @@ pub fn run() {
                 preview_terms: Mutex::new(Vec::new()),
                 toast_sequence: AtomicU32::new(u32::MAX),
                 toast_generation: AtomicU32::new(0),
-                phone_stop: Mutex::new(None),
+                phone_server: Mutex::new(None),
                 phone_state: Mutex::new(PhoneRuntime::default()),
             });
             // 配置窗口使用 create:false：Tauri 默认在用户 setup 前创建窗口，
@@ -1133,7 +1142,9 @@ pub fn run() {
             // 上次运行留下的验证码要补扫一次：进程重启会丢掉内存里的定时器。
             let state = app.state::<AppState>();
             let ttl = config.phone.code_ttl_secs;
-            if let Err(error) = lock(&state.store).and_then(|mut store| store.sweep_codes(PHONE_CODE_TAG, ttl)) {
+            if let Err(error) =
+                lock(&state.store).and_then(|mut store| store.sweep_codes(PHONE_CODE_TAG, ttl))
+            {
                 report(app.handle(), error);
             }
             sync_phone(app.handle());
@@ -1153,25 +1164,25 @@ pub fn run() {
                 return;
             }
             match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = hide_popup(window.app_handle().clone());
-            }
-            tauri::WindowEvent::Focused(false) => {
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    std::thread::sleep(Duration::from_millis(100));
-                    let foreground = platform::target_window();
-                    let inside = ["main", "preview"].iter().any(|label| {
-                        app.get_webview_window(label)
-                            .and_then(|w| w.hwnd().ok())
-                            .is_some_and(|hwnd| hwnd.0 as isize == foreground)
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = hide_popup(window.app_handle().clone());
+                }
+                tauri::WindowEvent::Focused(false) => {
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        let foreground = platform::target_window();
+                        let inside = ["main", "preview"].iter().any(|label| {
+                            app.get_webview_window(label)
+                                .and_then(|w| w.hwnd().ok())
+                                .is_some_and(|hwnd| hwnd.0 as isize == foreground)
+                        });
+                        if !inside {
+                            let _ = hide_popup(app);
+                        }
                     });
-                    if !inside {
-                        let _ = hide_popup(app);
-                    }
-                });
-            }
+                }
                 _ => {}
             }
         })
